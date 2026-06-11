@@ -1,0 +1,10 @@
+backend/.venv/
+frontend/node_modules/
+frontend/dist/
+data/
+obsidian_vault/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
