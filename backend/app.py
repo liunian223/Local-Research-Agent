@@ -201,12 +201,24 @@ def has_partial_note_fallback(fallbacks: list[Any]) -> bool:
 
 def task_type_from_message(message: str, has_upload: bool = False) -> str:
     lowered = message.lower()
-    wants_note = any(token in lowered for token in ["生成笔记", "阅读笔记", "笔记", "obsidian", "note"])
-    if has_upload and wants_note:
+    wants_note_after_upload = any(token in lowered for token in ["生成笔记", "阅读笔记", "笔记", "obsidian", "note"])
+    wants_generate_note = any(
+        token in lowered
+        for token in [
+            "生成笔记",
+            "阅读笔记",
+            "生成 obsidian",
+            "obsidian 阅读笔记",
+            "generate note",
+            "create note",
+            "write note",
+        ]
+    )
+    if has_upload and wants_note_after_upload:
         return "import_and_note"
     if has_upload:
         return "import_paper"
-    if wants_note:
+    if wants_generate_note:
         return "generate_note"
     return "global_chat" if "全知识库" in message else "paper_chat"
 

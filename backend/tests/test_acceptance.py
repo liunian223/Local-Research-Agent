@@ -152,3 +152,67 @@ def test_import_note_artifacts_execution_and_paper_and_note_scope(tmp_path: Path
         source_types = {item["source_type"] for item in chat_body["execution"]["rag_evidence"]}
         assert source_types & {"paper", "note"}
         assert chat_body["execution"]["graph_state"]["node_visit_limit_ok"] is True
+
+
+def test_search_scopes_and_duplicate_pdf_reuse_existing_paper(tmp_path: Path) -> None:
+    with TestClient(app) as client:
+        pdf = make_pdf(
+            tmp_path,
+            "scope_duplicate.pdf",
+            (
+                "Scope Duplicate Retrieval Paper\nJane Scope, Mark Author\n2026\nAbstract\n"
+                "This paper contains a distinctive retrieval keyword: scopefusion. "
+                "The generated note should create note chunks for note only retrieval."
+            ),
+        )
+        first = post_pdf(client, pdf, message="note")
+        first_body = first.json()
+        assert first.status_code == 200
+        paper_id = first_body["current_paper"]["paper_id"]
+
+        search_title = client.get("/api/papers/search", params={"keyword": "Scope Duplicate"})
+        assert search_title.status_code == 200
+        assert any(item["id"] == paper_id for item in search_title.json()["papers"])
+
+        search_author = client.get("/api/papers/search", params={"keyword": "Jane Scope"})
+        assert search_author.status_code == 200
+        assert any(item["id"] == paper_id for item in search_author.json()["papers"])
+
+        note_only = client.post(
+            "/api/chat/message",
+            json={
+                "message": "scopefusion note chunks",
+                "current_paper_id": paper_id,
+                "current_folder_id": "folder_all",
+                "chat_scope": "note_only",
+            },
+        )
+        assert note_only.status_code == 200
+        note_evidence = note_only.json()["execution"]["rag_evidence"]
+        assert note_evidence
+        assert {item["source_type"] for item in note_evidence} == {"note"}
+
+        global_chat = client.post(
+            "/api/chat/message",
+            json={
+                "message": "scopefusion retrieval keyword",
+                "current_paper_id": paper_id,
+                "current_folder_id": "folder_all",
+                "chat_scope": "global_library",
+            },
+        )
+        assert global_chat.status_code == 200
+        assert global_chat.json()["execution"]["rag_evidence"]
+
+        duplicate = post_pdf(client, pdf, message="")
+        duplicate_body = duplicate.json()
+        assert duplicate.status_code == 200
+        assert duplicate_body["current_paper"]["paper_id"] == paper_id
+        assert "duplicate_pdf_returned_existing_paper" in duplicate_body["execution"]["fallbacks"]
+
+        all_papers = client.get("/api/papers", params={"folder_id": "folder_all"}).json()["papers"]
+        matching = [item for item in all_papers if item["file_sha256"]]
+        sha_counts = {}
+        for item in matching:
+            sha_counts[item["file_sha256"]] = sha_counts.get(item["file_sha256"], 0) + 1
+        assert sha_counts[next(item["file_sha256"] for item in matching if item["id"] == paper_id)] == 1

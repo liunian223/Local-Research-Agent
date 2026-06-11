@@ -100,17 +100,9 @@ def stable_id(*parts: str) -> str:
 
 
 def build_where(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    paper_ids = sorted({row.get("paper_id") for row in rows if row.get("paper_id")})
-    note_ids = sorted({row.get("note_id") for row in rows if row.get("note_id")})
-    clauses = []
-    if paper_ids:
-        clauses.append({"paper_id": {"$in": paper_ids}})
-    if note_ids:
-        clauses.append({"note_id": {"$in": note_ids}})
-    if len(clauses) == 1:
-        return clauses[0]
-    if len(clauses) > 1:
-        return {"$or": clauses}
+    chunk_ids = sorted({row.get("id") or row.get("chunk_id") for row in rows if row.get("id") or row.get("chunk_id")})
+    if chunk_ids:
+        return {"chunk_id": {"$in": chunk_ids}}
     return {}
 
 
