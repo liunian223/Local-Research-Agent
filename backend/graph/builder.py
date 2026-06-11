@@ -4,6 +4,12 @@ from typing import Callable
 
 from graph.state import AgentState
 
+try:
+    from langgraph.graph import END, StateGraph
+except Exception:  # pragma: no cover - optional runtime dependency fallback.
+    END = None
+    StateGraph = None
+
 
 PHASES = {
     "START",
@@ -103,7 +109,7 @@ def finish_node(state: AgentState) -> AgentState:
     return state
 
 
-def run_graph(
+def run_graph_fallback(
     initial_state: AgentState,
     knowledge_node: Callable[[AgentState], AgentState],
     note_node: Callable[[AgentState], AgentState],
@@ -130,3 +136,65 @@ def run_graph(
         state["error"] = "Graph recursion limit exceeded."
         state["answer"] = "任务执行中止：检测到异常循环。"
     return finish_node(state)
+
+
+def build_langgraph_app(
+    knowledge_node: Callable[[AgentState], AgentState],
+    note_node: Callable[[AgentState], AgentState],
+) -> object | None:
+    if StateGraph is None or END is None:
+        return None
+
+    graph = StateGraph(dict)
+    graph.add_node("coordinator_node", coordinator_node)
+    graph.add_node("knowledge_rag_agent_node", knowledge_node)
+    graph.add_node("note_skill_agent_node", note_node)
+    graph.add_node("finish_node", finish_node)
+
+    graph.set_entry_point("coordinator_node")
+    graph.add_conditional_edges(
+        "coordinator_node",
+        route_after_coordinator,
+        {
+            "knowledge_rag_agent_node": "knowledge_rag_agent_node",
+            "finish_node": "finish_node",
+        },
+    )
+    graph.add_conditional_edges(
+        "knowledge_rag_agent_node",
+        route_after_knowledge,
+        {
+            "knowledge_rag_agent_node": "knowledge_rag_agent_node",
+            "note_skill_agent_node": "note_skill_agent_node",
+            "finish_node": "finish_node",
+        },
+    )
+    graph.add_conditional_edges(
+        "note_skill_agent_node",
+        route_after_note_skill,
+        {
+            "knowledge_rag_agent_node": "knowledge_rag_agent_node",
+            "finish_node": "finish_node",
+        },
+    )
+    graph.add_edge("finish_node", END)
+    return graph.compile()
+
+
+def run_graph(
+    initial_state: AgentState,
+    knowledge_node: Callable[[AgentState], AgentState],
+    note_node: Callable[[AgentState], AgentState],
+) -> AgentState:
+    app = build_langgraph_app(knowledge_node, note_node)
+    if app is None:
+        return run_graph_fallback(initial_state, knowledge_node, note_node)
+    try:
+        result = app.invoke(initial_state, {"recursion_limit": 12})
+    except Exception as exc:
+        failed_state = dict(initial_state)
+        failed_state["phase"] = "ERROR"
+        failed_state["status"] = "failed"
+        failed_state["error"] = f"LangGraph execution failed: {exc}"
+        return run_graph_fallback(failed_state, knowledge_node, note_node)
+    return result

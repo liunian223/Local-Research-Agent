@@ -101,7 +101,7 @@ The tests cover health, `All Papers`, folder deletion rules, PDF upload security
 - OCR fallback is disabled by default.
 - Word export is not implemented.
 - The first version exposes only one Deep Paper Note Skill.
-- MCP is represented as same-process tool-call records instead of four independent server processes.
-- The first version uses an in-process graph runner with LangGraph-compatible state/router semantics instead of launching separate Agent services.
+- MCP runs in-process through ToolGateway records instead of four independent service processes, matching the v1.2 demo deployment note.
+- Graph execution uses official LangGraph when the dependency is installed, with an in-process compatible fallback for offline/local smoke tests.
 - RAG attempts Chroma first and uses a local keyword fallback when Chroma or embedding dependencies are unavailable.
 - PDF parsing may be `partial` or `failed`, but the paper is still allowed into the local library.
