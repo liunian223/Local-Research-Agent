@@ -50,9 +50,8 @@ $env:OBSIDIAN_NOTE_DIR="02_ReadingNotes"
 ## Start Backend
 
 ```powershell
+conda activate agent
 cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ```
@@ -75,10 +74,10 @@ Open `http://127.0.0.1:5173`.
 
 ## Run Tests
 
-Backend acceptance tests use isolated temporary data, database, and Obsidian vault paths. On this Windows/Anaconda setup, disable external pytest plugin autoloading for a stable run:
+Backend acceptance tests use isolated temporary data, database, and Obsidian vault paths. Run them from the Anaconda `agent` environment:
 
 ```powershell
-$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"
+conda activate agent
 python -m pytest backend\tests -q
 ```
 
@@ -102,6 +101,6 @@ The tests cover health, `All Papers`, folder deletion rules, PDF upload security
 - Word export is not implemented.
 - The first version exposes only one Deep Paper Note Skill.
 - MCP runs in-process through ToolGateway records instead of four independent service processes, matching the v1.2 demo deployment note.
-- Graph execution uses official LangGraph when the dependency is installed, with an in-process compatible fallback for offline/local smoke tests.
+- Graph execution uses official LangGraph through `StateGraph`; run the backend with the Anaconda `agent` environment so the installed runtime is actually used.
 - RAG attempts Chroma first and uses a local keyword fallback when Chroma or embedding dependencies are unavailable.
 - PDF parsing may be `partial` or `failed`, but the paper is still allowed into the local library.

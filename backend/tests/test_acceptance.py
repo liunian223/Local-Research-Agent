@@ -20,8 +20,10 @@ os.environ["DEEPSEEK_API_KEY"] = ""
 
 import fitz
 from fastapi.testclient import TestClient
+from langgraph.graph import StateGraph
 
 from app import app
+from graph.builder import build_langgraph_app
 
 
 def make_pdf(tmp_path: Path, name: str, text: str) -> Path:
@@ -41,6 +43,21 @@ def post_pdf(client: TestClient, path: Path, folder_id: str = "folder_all", mess
             data={"current_folder_id": folder_id, "message": message},
             files={"file": (path.name, handle, "application/pdf")},
         )
+
+
+def test_graph_runtime_uses_installed_langgraph() -> None:
+    def knowledge_node(state: dict) -> dict:
+        state["phase"] = "IMPORT_DONE"
+        return state
+
+    def note_node(state: dict) -> dict:
+        state["phase"] = "NOTE_READY"
+        return state
+
+    graph_app = build_langgraph_app(knowledge_node, note_node)
+
+    assert StateGraph.__module__.startswith("langgraph.")
+    assert graph_app.__class__.__module__.startswith("langgraph.")
 
 
 def test_health_and_system_folder_rules() -> None:
