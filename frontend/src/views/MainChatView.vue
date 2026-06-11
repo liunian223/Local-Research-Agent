@@ -28,8 +28,9 @@
             </div>
           </button>
         </div>
-        <div class="row" style="margin-top: 8px">
-          <button :disabled="currentFolder?.is_system" @click="deleteFolder">删除空文件夹</button>
+        <div class="folder-actions">
+          <button v-if="currentFolder && !currentFolder.is_system" @click="deleteFolder">删除空文件夹</button>
+          <span v-else class="muted">系统文件夹固定保留</span>
         </div>
 
         <div class="section-title">Papers</div>

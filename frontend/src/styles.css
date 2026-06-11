@@ -126,6 +126,13 @@ button:disabled {
   background: #e8f2ee;
 }
 
+.folder-actions {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  margin-top: 8px;
+}
+
 .paper-title {
   font-weight: 650;
   line-height: 1.3;
