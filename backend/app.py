@@ -32,10 +32,6 @@ app.add_middleware(
 )
 
 
-class FolderCreate(BaseModel):
-    name: str
-
-
 class ChatMessage(BaseModel):
     message: str
     current_paper_id: Optional[str] = None
@@ -76,44 +72,20 @@ def list_folders() -> dict[str, Any]:
     return {"folders": folders}
 
 
-@app.post("/api/folders")
-def create_folder(payload: FolderCreate) -> dict[str, Any]:
-    name = payload.name.strip()
-    if not name:
-        raise api_error(400, "empty_folder_name", "Folder name cannot be empty.")
-    if "/" in name or "\\" in name:
-        raise api_error(400, "invalid_folder_name", "Folder name cannot contain path separators.")
-    with connect() as conn:
-        exists = conn.execute("SELECT id FROM folders WHERE name = ?", (name,)).fetchone()
-        if exists:
-            raise api_error(409, "folder_exists", "Folder already exists.")
-        item = {"id": new_id("folder"), "name": name, "is_system": 0, "created_at": now_iso(), "updated_at": now_iso()}
-        conn.execute(
-            "INSERT INTO folders (id, name, is_system, created_at, updated_at) VALUES (:id, :name, :is_system, :created_at, :updated_at)",
-            item,
-        )
-    item["is_system"] = False
-    return {"folder": item}
-
-
-@app.delete("/api/folders/{folder_id}")
-def delete_folder(folder_id: str) -> dict[str, str]:
-    with connect() as conn:
-        folder = conn.execute("SELECT * FROM folders WHERE id = ?", (folder_id,)).fetchone()
-        if not folder:
-            raise api_error(404, "folder_not_found", "Folder not found.")
-        if folder["is_system"]:
-            raise api_error(400, "cannot_delete_system_folder", "All Papers cannot be deleted.")
-        count = conn.execute("SELECT COUNT(*) AS count FROM papers WHERE folder_id = ?", (folder_id,)).fetchone()["count"]
-        if count:
-            raise api_error(400, "folder_not_empty", "Cannot delete a non-empty folder.")
-        conn.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
-    return {"status": "deleted"}
-
-
 def paper_dict(row: Any) -> dict[str, Any]:
     paper = row_to_dict(row) or {}
     return paper
+
+
+def papers_with_notes(conn: Any, rows: list[Any]) -> list[dict[str, Any]]:
+    papers = rows_to_dicts(rows)
+    for paper in papers:
+        note = conn.execute(
+            "SELECT id, obsidian_path, created_at, updated_at FROM reading_notes WHERE paper_id = ? ORDER BY created_at DESC LIMIT 1",
+            (paper["id"],),
+        ).fetchone()
+        paper["latest_note"] = row_to_dict(note)
+    return papers
 
 
 @app.get("/api/papers")
@@ -123,7 +95,8 @@ def list_papers(folder_id: str = "folder_all") -> dict[str, Any]:
             rows = conn.execute("SELECT * FROM papers ORDER BY created_at DESC").fetchall()
         else:
             rows = conn.execute("SELECT * FROM papers WHERE folder_id = ? ORDER BY created_at DESC", (folder_id,)).fetchall()
-    return {"papers": rows_to_dicts(rows)}
+        papers = papers_with_notes(conn, rows)
+    return {"papers": papers}
 
 
 @app.get("/api/papers/search")
@@ -134,7 +107,8 @@ def search_papers(keyword: str = "") -> dict[str, Any]:
             "SELECT * FROM papers WHERE title LIKE ? OR authors LIKE ? ORDER BY created_at DESC",
             (like, like),
         ).fetchall()
-    return {"papers": rows_to_dicts(rows)}
+        papers = papers_with_notes(conn, rows)
+    return {"papers": papers}
 
 
 @app.get("/api/papers/{paper_id}")
@@ -145,6 +119,63 @@ def get_paper(paper_id: str) -> dict[str, Any]:
             raise api_error(404, "paper_not_found", "Paper not found.")
         note = conn.execute("SELECT * FROM reading_notes WHERE paper_id = ? ORDER BY created_at DESC LIMIT 1", (paper_id,)).fetchone()
     return {"paper": paper_dict(paper), "note": row_to_dict(note)}
+
+
+@app.delete("/api/papers/{paper_id}")
+def delete_paper(paper_id: str) -> dict[str, Any]:
+    with connect() as conn:
+        paper = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
+        if not paper:
+            raise api_error(404, "paper_not_found", "Paper not found.")
+        deleted_papers = delete_papers(conn, [paper_dict(paper)])
+    return {"status": "deleted", "deleted_papers": deleted_papers}
+
+
+def safe_unlink(path: str | Path | None, roots: list[Path]) -> bool:
+    if not path:
+        return False
+    try:
+        target = Path(path).resolve()
+        if not any(target.is_relative_to(root.resolve()) for root in roots):
+            return False
+        if target.is_file():
+            target.unlink()
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def cleanup_paths_for_paper(paper: dict[str, Any]) -> list[Path]:
+    paths: list[Path] = []
+    paper_id = paper.get("id")
+    file_path = paper.get("file_path")
+    note_path = paper.get("obsidian_note_path")
+    if file_path:
+        paths.append(Path(file_path))
+        paths.append(safe_obsidian_attachment_path(Path(file_path).name))
+    if paper_id:
+        paths.append(config.PARSED_DIR / f"{paper_id}.txt")
+    if note_path:
+        paths.append(Path(note_path))
+    return paths
+
+
+def delete_papers(conn: Any, papers: list[dict[str, Any]]) -> int:
+    if not papers:
+        return 0
+    paper_ids = [paper["id"] for paper in papers]
+    placeholders = ",".join("?" for _ in paper_ids)
+    roots = [config.PAPER_DIR, config.PARSED_DIR, config.OBSIDIAN_VAULT_PATH]
+    for paper in papers:
+        for path in cleanup_paths_for_paper(paper):
+            safe_unlink(path, roots)
+    conn.execute(f"DELETE FROM note_chunks WHERE paper_id IN ({placeholders})", paper_ids)
+    conn.execute(f"DELETE FROM reading_notes WHERE paper_id IN ({placeholders})", paper_ids)
+    conn.execute(f"DELETE FROM paper_chunks WHERE paper_id IN ({placeholders})", paper_ids)
+    conn.execute(f"DELETE FROM papers WHERE id IN ({placeholders})", paper_ids)
+    conn.execute(f"UPDATE agent_tasks SET current_paper_id = NULL WHERE current_paper_id IN ({placeholders})", paper_ids)
+    return len(paper_ids)
 
 
 def collect_scope_chunks(conn: Any, scope: str, paper_id: str | None) -> list[dict[str, Any]]:
@@ -188,6 +219,54 @@ def execution_from(conn: Any, task_id: str, evidence: list[dict[str, Any]], skil
         "skill_phases": skill_phases,
         "rag_evidence": evidence,
         "fallbacks": fallbacks,
+    }
+
+
+def history_message_text(task: dict[str, Any]) -> str:
+    if task.get("user_input"):
+        return task["user_input"]
+    if task.get("task_type") in {"import_paper", "import_and_note"}:
+        return "上传 PDF"
+    return ""
+
+
+@app.get("/api/chat/history")
+def chat_history(limit: int = 50) -> dict[str, Any]:
+    limit = max(1, min(limit, 200))
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM agent_tasks
+            WHERE status = 'done'
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        tasks = list(reversed(rows_to_dicts(rows)))
+        messages: list[dict[str, Any]] = []
+        for task in tasks:
+            user_text = history_message_text(task)
+            if user_text:
+                messages.append({"role": "user", "text": user_text, "task_id": task["id"]})
+            if task.get("answer"):
+                messages.append({"role": "assistant", "text": task["answer"], "task_id": task["id"]})
+
+        latest = tasks[-1] if tasks else {}
+        paper = None
+        if latest.get("current_paper_id"):
+            paper = row_to_dict(conn.execute("SELECT * FROM papers WHERE id = ?", (latest["current_paper_id"],)).fetchone())
+            if paper:
+                note = conn.execute(
+                    "SELECT id, obsidian_path, created_at, updated_at FROM reading_notes WHERE paper_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (paper["id"],),
+                ).fetchone()
+                paper["latest_note"] = row_to_dict(note)
+    return {
+        "messages": messages,
+        "current_paper": paper,
+        "current_folder_id": latest.get("current_folder_id") or (paper.get("folder_id") if paper else "folder_all"),
+        "chat_scope": latest.get("chat_scope") or "paper_and_note",
     }
 
 
@@ -441,7 +520,10 @@ def generate_note(conn: Any, gateway: ToolGateway, task_id: str, paper: dict[str
             fallbacks.append("deepseek_note_generation_failed_local_note_used")
             log_mcp(conn, task_id, "llm", "deepseek_note_generation", llm_result.model, "DeepSeek note generation failed.", status="error", error=llm_result.error)
             phases.append({"name": "llm_note_generation", "status": "fallback", "summary": "DeepSeek call failed; used local note template."})
-    note_path = safe_obsidian_path(paper.get("title") or paper["id"])
+    folder = None
+    if paper.get("folder_id") and paper["folder_id"] != "folder_all":
+        folder = conn.execute("SELECT name FROM folders WHERE id = ?", (paper["folder_id"],)).fetchone()
+    note_path = safe_obsidian_path(paper.get("title") or paper["id"], folder["name"] if folder else None)
     gateway.invoke(
         "Note Skill Agent",
         "file",

@@ -4,8 +4,9 @@ Local Research Agent is a local research-paper Agent demo. The left side is a mi
 
 ## Features
 
-- One-page UI with Personal Library and Research Chat.
-- Folder creation and deletion for empty non-system folders.
+- One-page UI with `个人知识库` / `论文库` and Research Chat.
+- Single library surface without folder creation/deletion controls.
+- Paper deletion from the library, including related chunks, notes, parsed text, and local PDF artifacts.
 - Paper search by title and author only.
 - Secure PDF upload with extension, size, PDF header, filename, and path checks.
 - PDF metadata and text parsing fallback chain.
@@ -17,7 +18,8 @@ Local Research Agent is a local research-paper Agent demo. The left side is a mi
 - Agent node entrypoints live under `backend/agents`: `Knowledge RAG Agent` handles import/retrieval, and `Note Skill Agent` handles note generation/chat answers.
 - One exposed skill concept: `run_deep_paper_note_skill`, implemented as local Obsidian Markdown note generation.
 - Assistant responses include collapsible execution data for LangGraph-style nodes, MCP calls, A2A-style messages, RAG evidence, skill phases, and fallbacks.
-- Generated notes are written to the Obsidian note directory, and the source PDF is copied to the Obsidian attachment directory through the File MCP-style gateway.
+- Chat history and current UI context are restored from saved `agent_tasks` after page refresh.
+- Generated notes are shown under their paper card in the library, written to the Obsidian note directory, and the source PDF is copied to the Obsidian attachment directory through the File MCP-style gateway.
 
 ## Tech Stack
 
@@ -36,7 +38,15 @@ $env:DEEPSEEK_MODEL_NOTE="deepseek-v4-pro"
 $env:DEEPSEEK_MODEL_JSON="deepseek-v4-pro"
 ```
 
-You can copy `backend/.env.example` as a local reference, but keep the real key in your shell environment or an ignored `.env` file.
+You can copy `backend/.env.example` to `backend/.env` as a local reference, but keep the real key only in your shell environment or the ignored `backend/.env` file. `backend/config.py` loads `backend/.env` automatically, and `.gitignore` excludes it from commits.
+
+For the current local demo setup, use DeepSeek v4-pro for chat, notes, and JSON:
+
+```powershell
+DEEPSEEK_MODEL_CHAT=deepseek-v4-pro
+DEEPSEEK_MODEL_NOTE=deepseek-v4-pro
+DEEPSEEK_MODEL_JSON=deepseek-v4-pro
+```
 
 ## Set Obsidian Vault Path
 
@@ -83,19 +93,30 @@ python -m pytest backend\tests -q
 
 The tests cover health, `All Papers`, folder deletion rules, PDF upload security, note generation, Obsidian attachment copying, graph execution nodes, MCP-style tool calls, and `paper_and_note` retrieval.
 
+## UI And Library Behavior
+
+- The left library label is localized as `个人知识库`.
+- The system library is displayed as `论文库`.
+- Folder creation and folder deletion UI/API endpoints are intentionally removed.
+- Each paper card includes status pills and a `删除` button.
+- Generated reading notes appear under the corresponding paper card as `阅读笔记`.
+- User questions are displayed as right-aligned blue chat bubbles.
+- Long paths and long response text wrap inside their cards.
+- The chat history, selected paper, selected folder/library, and chat scope reload after refreshing the page.
+
 ## Demo Flow
 
-1. Open the app and confirm `All Papers` appears.
-2. Create a folder, for example `GNN`.
-3. Upload an English or Chinese PDF.
-4. Inspect parse, RAG, and note status in the paper card.
-5. Ask for an Obsidian reading note.
-6. Ask questions with `paper_only`, `note_only`, `paper_and_note`, or `global_library`.
+1. Open the app and confirm `论文库` appears.
+2. Upload an English or Chinese PDF.
+3. Inspect parse, RAG, note status, and generated note entry in the paper card.
+4. Ask for an Obsidian reading note.
+5. Ask questions with `paper_only`, `note_only`, `paper_and_note`, or `global_library`.
+6. Refresh the page and confirm the chat context is restored.
 7. Expand execution details under the assistant response.
 
 ## Current Limits
 
-- Folders only support first-level creation and deletion of empty folders.
+- Folder creation and deletion are disabled in the UI and API for the current demo.
 - Search only supports title and authors.
 - OCR fallback is disabled by default.
 - Word export is not implemented.

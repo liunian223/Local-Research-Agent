@@ -1,11 +1,15 @@
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 
 PROJECT_NAME = "Local Research Agent"
 
 BACKEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BACKEND_DIR.parent
+
+load_dotenv(BACKEND_DIR / ".env")
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")

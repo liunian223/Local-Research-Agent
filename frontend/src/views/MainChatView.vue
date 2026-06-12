@@ -7,14 +7,9 @@
 
     <div class="workspace">
       <aside class="sidebar">
-        <div class="section-title">Personal Library</div>
-        <div class="row">
-          <input v-model="folderName" class="input" placeholder="新建文件夹" @keyup.enter="createFolder" />
-          <button title="Create folder" @click="createFolder">+</button>
-        </div>
+        <div class="section-title">个人知识库</div>
 
-        <div class="section-title">Folders</div>
-        <div class="stack">
+        <div class="stack folder-list">
           <button
             v-for="folder in folders"
             :key="folder.id"
@@ -23,17 +18,13 @@
             @click="selectFolder(folder.id)"
           >
             <div class="row">
-              <span>{{ folder.name }}</span>
+              <span>{{ displayFolderName(folder) }}</span>
               <span v-if="folder.is_system" class="pill">system</span>
             </div>
           </button>
         </div>
-        <div class="folder-actions">
-          <button v-if="currentFolder && !currentFolder.is_system" @click="deleteFolder">删除空文件夹</button>
-          <span v-else class="muted">系统文件夹固定保留</span>
-        </div>
 
-        <div class="section-title">Papers</div>
+        <div class="section-title">论文</div>
         <input v-model="keyword" class="input" placeholder="搜索标题 / 作者" @input="searchPapers" />
         <div class="stack" style="margin-top: 10px">
           <button
@@ -43,12 +34,20 @@
             :class="{ active: paper.id === currentPaper?.id }"
             @click="selectPaper(paper)"
           >
-            <div class="paper-title">{{ paper.title || "Untitled Paper" }}</div>
+            <div class="paper-header">
+              <div class="paper-title">{{ paper.title || "Untitled Paper" }}</div>
+              <button class="danger-button" title="删除论文" @click.stop="deletePaper(paper)">删除</button>
+            </div>
             <div class="muted">{{ paper.authors || "Unknown authors" }}</div>
             <div class="status-line">
               <span class="pill">parse {{ paper.parse_status }}</span>
               <span class="pill">rag {{ paper.vector_status }}</span>
               <span class="pill">note {{ paper.note_status }}</span>
+            </div>
+            <div v-if="paper.latest_note" class="note-item">
+              <span class="note-dot"></span>
+              <span class="note-name">阅读笔记</span>
+              <span class="note-path">{{ paper.latest_note.obsidian_path }}</span>
             </div>
           </button>
         </div>
@@ -65,7 +64,7 @@
               <span class="pill">parse {{ currentPaper.parse_status }}</span>
               <span class="pill">note {{ currentPaper.note_status }}</span>
             </div>
-            <div v-if="currentPaper.obsidian_note_path" class="muted">Note: {{ currentPaper.obsidian_note_path }}</div>
+            <div v-if="currentPaper.obsidian_note_path" class="muted note-path-full">Note: {{ currentPaper.obsidian_note_path }}</div>
           </div>
 
           <article v-for="(message, index) in messages" :key="index" class="message" :class="message.role">
@@ -95,7 +94,7 @@
           </div>
           <div class="row" style="align-items: flex-end; margin-top: 10px">
             <textarea v-model="draft" class="textarea" placeholder="输入科研问题或任务" @keydown.ctrl.enter.prevent="sendMessage"></textarea>
-            <button :disabled="busy || !draft.trim()" @click="sendMessage">发送</button>
+            <button class="send-button" :disabled="busy || !draft.trim()" @click="sendMessage">发送</button>
           </div>
           <div v-if="error" class="muted" style="margin-top: 8px">{{ error }}</div>
         </section>
@@ -106,16 +105,15 @@
 
 <script setup lang="ts">
 import axios from "axios";
-import { computed, onMounted, ref } from "vue";
+import { onMounted, ref } from "vue";
 import ExecutionPanel from "../components/ExecutionPanel.vue";
 import type { ChatMessage, Folder, Paper } from "../types";
 
 const folders = ref<Folder[]>([]);
 const papers = ref<Paper[]>([]);
 const messages = ref<ChatMessage[]>([
-  { role: "assistant", text: "系统已就绪。请创建文件夹、上传 PDF，或选择论文后提问。" }
+  { role: "assistant", text: "系统已就绪。请上传 PDF，或选择论文后提问。" }
 ]);
-const folderName = ref("");
 const keyword = ref("");
 const currentFolderId = ref("folder_all");
 const currentPaper = ref<Paper | null>(null);
@@ -126,7 +124,9 @@ const busy = ref(false);
 const error = ref("");
 const fileInput = ref<HTMLInputElement | null>(null);
 
-const currentFolder = computed(() => folders.value.find((folder) => folder.id === currentFolderId.value));
+function displayFolderName(folder: Folder): string {
+  return folder.id === "folder_all" ? "论文库" : folder.name;
+}
 
 function apiMessage(err: unknown): string {
   if (axios.isAxiosError(err)) {
@@ -145,23 +145,29 @@ async function loadPapers() {
   papers.value = response.data.papers;
 }
 
-async function createFolder() {
-  if (!folderName.value.trim()) return;
-  try {
-    await axios.post("/api/folders", { name: folderName.value.trim() });
-    folderName.value = "";
-    await loadFolders();
-  } catch (err) {
-    error.value = apiMessage(err);
+async function loadChatHistory() {
+  const response = await axios.get("/api/chat/history");
+  if (response.data.messages?.length) {
+    messages.value = response.data.messages;
+  }
+  if (response.data.current_folder_id) {
+    currentFolderId.value = response.data.current_folder_id;
+  }
+  if (response.data.chat_scope) {
+    chatScope.value = response.data.chat_scope;
+  }
+  if (response.data.current_paper) {
+    currentPaper.value = response.data.current_paper;
   }
 }
 
-async function deleteFolder() {
-  if (!currentFolder.value || currentFolder.value.is_system) return;
+async function deletePaper(paper: Paper) {
   try {
-    await axios.delete(`/api/folders/${currentFolder.value.id}`);
-    currentFolderId.value = "folder_all";
-    await Promise.all([loadFolders(), loadPapers()]);
+    await axios.delete(`/api/papers/${paper.id}`);
+    if (currentPaper.value?.id === paper.id) {
+      currentPaper.value = null;
+    }
+    await loadPapers();
   } catch (err) {
     error.value = apiMessage(err);
   }
@@ -256,7 +262,12 @@ function quickNote() {
 
 onMounted(async () => {
   try {
-    await Promise.all([loadFolders(), loadPapers()]);
+    await Promise.all([loadFolders(), loadChatHistory()]);
+    await loadPapers();
+    if (currentPaper.value) {
+      const refreshed = papers.value.find((paper) => paper.id === currentPaper.value?.id);
+      if (refreshed) currentPaper.value = refreshed;
+    }
   } catch (err) {
     error.value = apiMessage(err);
   }

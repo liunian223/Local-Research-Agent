@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 from langgraph.graph import StateGraph
 
 from app import app
+from database import connect, now_iso
 from graph.builder import build_langgraph_app
 
 
@@ -71,28 +72,22 @@ def test_health_and_system_folder_rules() -> None:
         assert folders[0]["name"] == "All Papers"
         assert folders[0]["is_system"] is True
 
-        delete_all = client.delete("/api/folders/folder_all")
-        assert delete_all.status_code == 400
-        assert delete_all.json()["detail"]["error"]["code"] == "cannot_delete_system_folder"
 
-
-def test_folder_lifecycle_and_non_empty_delete_rejected(tmp_path: Path) -> None:
+def test_delete_paper_removes_it_from_library(tmp_path: Path) -> None:
     with TestClient(app) as client:
-        folder = client.post("/api/folders", json={"name": "AcceptanceFolder"}).json()["folder"]
-        assert client.delete(f"/api/folders/{folder['id']}").status_code == 200
-
-        folder = client.post("/api/folders", json={"name": "NonEmptyFolder"}).json()["folder"]
         pdf = make_pdf(
             tmp_path,
-            "non_empty_folder.pdf",
-            "Non Empty Folder Paper\nAlice Test\n2026\nAbstract\nThis paper proves non empty folder deletion is rejected.",
+            "delete_single_paper.pdf",
+            "Delete Single Paper\nAlice Test\n2026\nAbstract\nThis paper validates deleting one paper from the library.",
         )
-        upload = post_pdf(client, pdf, folder_id=folder["id"])
+        upload = post_pdf(client, pdf)
         assert upload.status_code == 200
+        paper_id = upload.json()["current_paper"]["paper_id"]
 
-        rejected = client.delete(f"/api/folders/{folder['id']}")
-        assert rejected.status_code == 400
-        assert rejected.json()["detail"]["error"]["code"] == "folder_not_empty"
+        deleted = client.delete(f"/api/papers/{paper_id}")
+        assert deleted.status_code == 200
+        assert deleted.json()["deleted_papers"] == 1
+        assert client.get(f"/api/papers/{paper_id}").status_code == 404
 
 
 def test_upload_security_rejects_bad_mime_and_bad_pdf_header() -> None:
@@ -171,6 +166,33 @@ def test_import_note_artifacts_execution_and_paper_and_note_scope(tmp_path: Path
         assert chat_body["execution"]["graph_state"]["node_visit_limit_ok"] is True
 
 
+def test_generated_note_is_listed_under_paper_and_folder_path(tmp_path: Path) -> None:
+    with TestClient(app) as client:
+        now = now_iso()
+        with connect() as conn:
+            conn.execute(
+                "INSERT INTO folders (id, name, is_system, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                ("folder_notes", "FolderNotes", 0, now, now),
+            )
+        pdf = make_pdf(
+            tmp_path,
+            "folder_note_path.pdf",
+            (
+                "Folder Note Path Paper\nLocal Research Agent Team\n2026\nAbstract\n"
+                "This paper validates that generated notes are shown in the library and stored under folder paths."
+            ),
+        )
+        upload = post_pdf(client, pdf, folder_id="folder_notes", message="note")
+        assert upload.status_code == 200
+        paper_id = upload.json()["current_paper"]["paper_id"]
+
+        papers = client.get("/api/papers", params={"folder_id": "folder_notes"}).json()["papers"]
+        listed = next(item for item in papers if item["id"] == paper_id)
+        assert listed["latest_note"]
+        assert Path(listed["latest_note"]["obsidian_path"]).exists()
+        assert Path(listed["latest_note"]["obsidian_path"]).parent.name == "FolderNotes"
+
+
 def test_search_scopes_and_duplicate_pdf_reuse_existing_paper(tmp_path: Path) -> None:
     with TestClient(app) as client:
         pdf = make_pdf(
@@ -233,3 +255,39 @@ def test_search_scopes_and_duplicate_pdf_reuse_existing_paper(tmp_path: Path) ->
         for item in matching:
             sha_counts[item["file_sha256"]] = sha_counts.get(item["file_sha256"], 0) + 1
         assert sha_counts[next(item["file_sha256"] for item in matching if item["id"] == paper_id)] == 1
+
+
+def test_chat_history_restores_messages_and_context(tmp_path: Path) -> None:
+    with TestClient(app) as client:
+        pdf = make_pdf(
+            tmp_path,
+            "history_context.pdf",
+            (
+                "History Context Paper\nLocal Research Agent Team\n2026\nAbstract\n"
+                "This paper validates that chat history survives page refresh."
+            ),
+        )
+        upload = post_pdf(client, pdf)
+        assert upload.status_code == 200
+        paper_id = upload.json()["current_paper"]["paper_id"]
+
+        question = "刷新后还能看到这个问题吗"
+        chat = client.post(
+            "/api/chat/message",
+            json={
+                "message": question,
+                "current_paper_id": paper_id,
+                "current_folder_id": "folder_all",
+                "chat_scope": "paper_and_note",
+            },
+        )
+        assert chat.status_code == 200
+
+        history = client.get("/api/chat/history")
+        assert history.status_code == 200
+        body = history.json()
+        assert any(item["role"] == "user" and item["text"] == question for item in body["messages"])
+        assert any(item["role"] == "assistant" and item["text"] == chat.json()["answer"] for item in body["messages"])
+        assert body["current_paper"]["id"] == paper_id
+        assert body["current_folder_id"] == "folder_all"
+        assert body["chat_scope"] == "paper_and_note"

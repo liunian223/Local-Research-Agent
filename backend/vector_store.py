@@ -64,6 +64,8 @@ class VectorStore:
 
     def retrieve(self, query: str, rows: list[dict[str, Any]], top_k: int | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         top_k = top_k or config.RAG_TOP_K
+        if not rows:
+            return [], {"backend": self.backend, "fallback": self.collection is None}
         if self.collection is None:
             return score_chunks(query, rows, top_k), {"backend": self.backend, "fallback": True}
 

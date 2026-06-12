@@ -444,10 +444,13 @@ note_status: "partial"
 """
 
 
-def safe_obsidian_path(title: str) -> Path:
+def safe_obsidian_path(title: str, folder_name: str | None = None) -> Path:
     base = (config.OBSIDIAN_VAULT_PATH / config.OBSIDIAN_NOTE_DIR).resolve()
-    base.mkdir(parents=True, exist_ok=True)
-    target = (base / f"{safe_filename(title)}.md").resolve()
+    note_dir = base
+    if folder_name:
+        note_dir = (base / safe_filename(folder_name)).resolve()
+    note_dir.mkdir(parents=True, exist_ok=True)
+    target = (note_dir / f"{safe_filename(title)}.md").resolve()
     if not str(target).startswith(str(base)):
         raise ValueError("Resolved note path escapes Obsidian note directory.")
     return target

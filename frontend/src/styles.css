@@ -95,6 +95,11 @@ button:disabled {
   gap: 10px;
 }
 
+.folder-list {
+  margin-top: 6px;
+  margin-bottom: 8px;
+}
+
 .input,
 .textarea,
 .select {
@@ -109,6 +114,14 @@ button:disabled {
 .textarea {
   min-height: 76px;
   resize: vertical;
+}
+
+.send-button {
+  min-width: 72px;
+  height: 46px;
+  padding: 0 18px;
+  white-space: nowrap;
+  font-weight: 650;
 }
 
 .folder,
@@ -126,16 +139,65 @@ button:disabled {
   background: #e8f2ee;
 }
 
-.folder-actions {
-  min-height: 34px;
-  display: flex;
-  align-items: center;
-  margin-top: 8px;
-}
-
 .paper-title {
   font-weight: 650;
   line-height: 1.3;
+}
+
+.paper-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.danger-button {
+  flex: 0 0 auto;
+  height: 28px;
+  padding: 0 8px;
+  border-color: #e0b4b4;
+  color: #9f2f2f;
+  font-size: 13px;
+}
+
+.danger-button:hover {
+  background: #fff0f0;
+}
+
+.note-item {
+  display: grid;
+  grid-template-columns: 8px minmax(56px, auto) minmax(0, 1fr);
+  gap: 6px;
+  align-items: center;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #dde6e2;
+  color: #46525a;
+  font-size: 13px;
+}
+
+.note-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #3a7c6b;
+}
+
+.note-name {
+  font-weight: 650;
+}
+
+.note-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #6b7780;
+}
+
+.note-path-full {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .muted {
@@ -172,11 +234,17 @@ button:disabled {
   border-radius: 8px;
   padding: 12px;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   border: 1px solid #d8dfdc;
 }
 
 .message.user {
   margin-left: auto;
+  margin-right: 0;
+  width: fit-content;
+  max-width: min(820px, 78%);
+  text-align: right;
   background: #e7f0fb;
 }
 
