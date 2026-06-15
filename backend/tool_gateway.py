@@ -5,16 +5,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from database import log_mcp
+from harness.context_manager import redact_value
+from harness.policy import POLICY_RULES, check_tool_policy
 
 
 class ToolGateway:
     """In-process MCP-style tool gateway with policy checks and call logging."""
 
-    POLICY = {
-        "Knowledge RAG Agent": {"file", "database", "rag"},
-        "Note Skill Agent": {"a2a", "skills", "file", "database", "rag", "llm"},
-        "Harness": {"file", "database", "rag", "skills", "llm", "a2a"},
-    }
+    POLICY = POLICY_RULES
 
     def __init__(self, conn: Any, task_id: str) -> None:
         self.conn = conn
@@ -31,8 +29,10 @@ class ToolGateway:
         output_summarizer: Callable[[Any], str] | None = None,
         **kwargs: Any,
     ) -> Any:
-        self._check_policy(agent_name, server_name, tool_name)
+        policy_check = self._check_policy(agent_name, server_name, tool_name)
         started = time.perf_counter()
+        summarized_input = input_summary or summarize_value(args or kwargs)
+        input_with_policy = f"{summarized_input}; policy={_json_policy(policy_check)}"
         try:
             result = func(*args, **kwargs)
             latency_ms = int((time.perf_counter() - started) * 1000)
@@ -42,8 +42,8 @@ class ToolGateway:
                 self.task_id,
                 server_name,
                 tool_name,
-                input_summary or summarize_value(args or kwargs),
-                output_summary,
+                input_with_policy,
+                redact_value(output_summary),
                 status="ok",
                 latency_ms=latency_ms,
             )
@@ -55,7 +55,7 @@ class ToolGateway:
                 self.task_id,
                 server_name,
                 tool_name,
-                input_summary or summarize_value(args or kwargs),
+                input_with_policy,
                 "Tool call failed.",
                 status="error",
                 error=str(exc),
@@ -63,10 +63,11 @@ class ToolGateway:
             )
             raise
 
-    def _check_policy(self, agent_name: str, server_name: str, tool_name: str) -> None:
-        allowed = self.POLICY.get(agent_name, set())
-        if server_name not in allowed:
-            raise PermissionError(f"{agent_name} is not allowed to call {server_name}.{tool_name}")
+    def _check_policy(self, agent_name: str, server_name: str, tool_name: str) -> dict[str, Any]:
+        policy_check = check_tool_policy(agent_name, server_name, tool_name)
+        if not policy_check["allowed"]:
+            raise PermissionError(policy_check["reason"])
+        return policy_check
 
 
 def summarize_value(value: Any) -> str:
@@ -84,8 +85,14 @@ def summarize_value(value: Any) -> str:
             if key.lower().endswith("text") or key.lower() in {"content", "paper_text"}:
                 parts.append(f"{key}=<{len(str(item))} chars>")
             else:
-                parts.append(f"{key}={str(item)[:80]}")
-        return ", ".join(parts)[:800]
+                parts.append(f"{key}={redact_value(item, 120)}")
+        return redact_value(", ".join(parts), 800)
     if isinstance(value, (list, tuple)):
         return f"{type(value).__name__}(len={len(value)})"
-    return repr(value)[:800]
+    return redact_value(repr(value), 800)
+
+
+def _json_policy(policy_check: dict[str, Any]) -> str:
+    import json
+
+    return json.dumps(policy_check, ensure_ascii=False, separators=(",", ":"))

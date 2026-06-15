@@ -11,4 +11,5 @@ pypdf
 chromadb
 sentence-transformers
 python-dotenv
+pillow
 pytest

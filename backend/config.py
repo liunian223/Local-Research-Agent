@@ -9,15 +9,44 @@ PROJECT_NAME = "Local Research Agent"
 BACKEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BACKEND_DIR.parent
 
-load_dotenv(BACKEND_DIR / ".env")
+ENV_NAME = os.getenv("LOCAL_RESEARCH_AGENT_ENV", "development")
+
+# Prefer the project-local .env over stale shell/user environment variables in
+# normal runs. Tests set environment values directly and should keep priority.
+load_dotenv(BACKEND_DIR / ".env", override=ENV_NAME != "test")
+
+TEXT_MODEL_PROVIDER = os.getenv("TEXT_MODEL_PROVIDER", "openai")
+VISION_MODEL_PROVIDER = os.getenv("VISION_MODEL_PROVIDER", "openai")
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")
+CODEX_CLI_COMMAND = os.getenv("CODEX_CLI_COMMAND", "codex")
+CODEX_CLI_MODEL = os.getenv("CODEX_CLI_MODEL", "")
+CODEX_CLI_TIMEOUT_SECONDS = int(os.getenv("CODEX_CLI_TIMEOUT_SECONDS", "180"))
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini")
+OPENAI_JSON_MODEL = os.getenv("OPENAI_JSON_MODEL", "gpt-4o-mini")
+OPENAI_NOTE_MODEL = os.getenv("OPENAI_NOTE_MODEL", "gpt-4o-mini")
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+OPENAI_EMBEDDING_DIMENSIONS = int(os.getenv("OPENAI_EMBEDDING_DIMENSIONS", "1536"))
+OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "90"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
+ENABLE_OPENAI_VISION = os.getenv("ENABLE_OPENAI_VISION", "true").lower() == "true"
+MAX_OPENAI_IMAGE_MB = int(os.getenv("MAX_OPENAI_IMAGE_MB", "10"))
+OPENAI_STORE_RESPONSES = os.getenv("OPENAI_STORE_RESPONSES", "false").lower() == "true"
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL_CHAT = os.getenv("DEEPSEEK_MODEL_CHAT", "deepseek-v4-flash")
-DEEPSEEK_MODEL_NOTE = os.getenv("DEEPSEEK_MODEL_NOTE", "deepseek-v4-pro")
-DEEPSEEK_MODEL_JSON = os.getenv("DEEPSEEK_MODEL_JSON", "deepseek-v4-pro")
+DEEPSEEK_MODEL_CHAT = os.getenv("DEEPSEEK_MODEL_CHAT", "deepseek-chat")
+DEEPSEEK_MODEL_NOTE = os.getenv("DEEPSEEK_MODEL_NOTE", "deepseek-chat")
+DEEPSEEK_MODEL_JSON = os.getenv("DEEPSEEK_MODEL_JSON", "deepseek-chat")
 DEEPSEEK_TIMEOUT_SECONDS = int(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "90"))
 DEEPSEEK_MAX_RETRIES = int(os.getenv("DEEPSEEK_MAX_RETRIES", "2"))
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
+ENABLE_GEMINI_VISION = os.getenv("ENABLE_GEMINI_VISION", "false").lower() == "true"
 
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", ROOT_DIR / "data" / "local_research_agent.db"))
 DATA_DIR = Path(os.getenv("DATA_DIR", ROOT_DIR / "data"))
@@ -47,6 +76,27 @@ MAX_CONTEXT_CHARS_PER_LLM_CALL = int(os.getenv("MAX_CONTEXT_CHARS_PER_LLM_CALL",
 MAX_EVIDENCE_ITEMS = int(os.getenv("MAX_EVIDENCE_ITEMS", "20"))
 MAX_EVIDENCE_CHARS = int(os.getenv("MAX_EVIDENCE_CHARS", "1200"))
 MAX_NOTE_REPAIR_ROUNDS = int(os.getenv("MAX_NOTE_REPAIR_ROUNDS", "2"))
+MAX_NOTE_IMAGE_ATTACHMENTS = int(os.getenv("MAX_NOTE_IMAGE_ATTACHMENTS", "6"))
+
+LAYOUT_RAG_PARSER_VERSION = os.getenv("LAYOUT_RAG_PARSER_VERSION", "layout-rag-v1")
+SEMANTIC_CHUNK_MAX_CHARS = int(os.getenv("SEMANTIC_CHUNK_MAX_CHARS", "1800"))
+SEMANTIC_CHUNK_MIN_CHARS = int(os.getenv("SEMANTIC_CHUNK_MIN_CHARS", "200"))
+SEMANTIC_CHUNK_SOFT_OVERLAP = int(os.getenv("SEMANTIC_CHUNK_SOFT_OVERLAP", "120"))
+
+RAG_ADAPTIVE_ENABLED = os.getenv("RAG_ADAPTIVE_ENABLED", "true").lower() == "true"
+RAG_QUERY_ANALYZER_USE_LLM = os.getenv("RAG_QUERY_ANALYZER_USE_LLM", "false").lower() == "true"
+RAG_ABSTRACT_DETECTION_ENABLED = os.getenv("RAG_ABSTRACT_DETECTION_ENABLED", "true").lower() == "true"
+RAG_ABSTRACT_DEFAULT_MODE = os.getenv("RAG_ABSTRACT_DEFAULT_MODE", "downweight")
+RAG_ABSTRACT_DOWNWEIGHT_FACTOR = float(os.getenv("RAG_ABSTRACT_DOWNWEIGHT_FACTOR", "0.75"))
+RAG_ABSTRACT_MAX_COMPLEX_EVIDENCE = int(os.getenv("RAG_ABSTRACT_MAX_COMPLEX_EVIDENCE", "1"))
+RAG_SIMPLE_VECTOR_TOP_K = int(os.getenv("RAG_SIMPLE_VECTOR_TOP_K", "20"))
+RAG_SIMPLE_KEYWORD_TOP_K = int(os.getenv("RAG_SIMPLE_KEYWORD_TOP_K", "20"))
+RAG_SIMPLE_FINAL_TOP_K = int(os.getenv("RAG_SIMPLE_FINAL_TOP_K", "6"))
+RAG_COMPLEX_SECTION_TOP_K = int(os.getenv("RAG_COMPLEX_SECTION_TOP_K", "5"))
+RAG_COMPLEX_MAX_EVIDENCE = int(os.getenv("RAG_COMPLEX_MAX_EVIDENCE", "14"))
+RAG_COMPLEX_MAX_RETRIEVAL_ROUNDS = int(os.getenv("RAG_COMPLEX_MAX_RETRIEVAL_ROUNDS", "2"))
+RAG_RERANKER = os.getenv("RAG_RERANKER", "rule_weighted_v1")
+RAG_ENABLE_OPTIONAL_CROSS_ENCODER = os.getenv("RAG_ENABLE_OPTIONAL_CROSS_ENCODER", "false").lower() == "true"
 
 ENABLE_OCR_FALLBACK = os.getenv("ENABLE_OCR_FALLBACK", "false").lower() == "true"
 

@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 TEST_ROOT = Path(tempfile.mkdtemp(prefix="local_research_agent_tests_"))
+os.environ["LOCAL_RESEARCH_AGENT_ENV"] = "test"
 os.environ["DATABASE_PATH"] = str(TEST_ROOT / "test.db")
 os.environ["DATA_DIR"] = str(TEST_ROOT / "data")
 os.environ["PAPER_DIR"] = str(TEST_ROOT / "data" / "papers")
@@ -16,15 +18,20 @@ os.environ["PARSED_DIR"] = str(TEST_ROOT / "data" / "parsed")
 os.environ["VECTOR_DIR"] = str(TEST_ROOT / "data" / "vector_store")
 os.environ["OBSIDIAN_VAULT_PATH"] = str(TEST_ROOT / "vault")
 os.environ["VECTOR_BACKEND"] = "local_keyword"
+os.environ["TEXT_MODEL_PROVIDER"] = "local_fallback"
+os.environ["VISION_MODEL_PROVIDER"] = "none"
+os.environ["EMBEDDING_PROVIDER"] = "local"
+os.environ["OPENAI_API_KEY"] = ""
 os.environ["DEEPSEEK_API_KEY"] = ""
 
 import fitz
 from fastapi.testclient import TestClient
 from langgraph.graph import StateGraph
 
-from app import app
+from app import app, collect_note_image_context
 from database import connect, now_iso
 from graph.builder import build_langgraph_app
+from llm.codex_cli_client import CodexCliClient
 
 
 def make_pdf(tmp_path: Path, name: str, text: str) -> Path:
@@ -32,6 +39,17 @@ def make_pdf(tmp_path: Path, name: str, text: str) -> Path:
     doc = fitz.open()
     page = doc.new_page()
     page.insert_text((72, 72), text)
+    doc.save(path)
+    doc.close()
+    return path
+
+
+def make_multipage_pdf(tmp_path: Path, name: str, pages: list[str]) -> Path:
+    path = tmp_path / name
+    doc = fitz.open()
+    for text in pages:
+        page = doc.new_page()
+        page.insert_text((72, 72), text)
     doc.save(path)
     doc.close()
     return path
@@ -257,6 +275,163 @@ def test_search_scopes_and_duplicate_pdf_reuse_existing_paper(tmp_path: Path) ->
         assert sha_counts[next(item["file_sha256"] for item in matching if item["id"] == paper_id)] == 1
 
 
+def test_layout_aware_rag_outputs_structured_artifacts_and_metadata(tmp_path: Path) -> None:
+    with TestClient(app) as client:
+        pdf = make_multipage_pdf(
+            tmp_path,
+            "layout_rag.pdf",
+            [
+                (
+                    "Layout Aware RAG Paper\nResearch Team\n2026\nAbstract\n"
+                    "This paper introduces layout aware retrieval.\n"
+                    "1 Introduction\n"
+                    "The introduction explains why page structure matters."
+                ),
+                (
+                    "2 Method\n"
+                    "The method section describes semantic chunk construction and section aware retrieval.\n"
+                    "Figure 1. Overall architecture of the layout aware paper RAG pipeline.\n"
+                    "The nearby text explains that the figure is summarized from caption and surrounding text."
+                ),
+                (
+                    "3 Experiments\n"
+                    "Table 1. Dataset statistics.\n"
+                    "Dataset  Nodes  Edges\n"
+                    "Alpha    10     20\n"
+                    "Beta     30     40\n"
+                    "The result section reports that metadata-aware retrieval improves grounding."
+                ),
+            ],
+        )
+        upload = post_pdf(client, pdf)
+        assert upload.status_code == 200
+        paper_id = upload.json()["current_paper"]["paper_id"]
+
+        parsed_root = TEST_ROOT / "data" / "parsed" / paper_id
+        assert (parsed_root / "layout.json").exists()
+        assert (parsed_root / "pages.json").exists()
+        assert (parsed_root / "sections.json").exists()
+        assert (parsed_root / "chunks.json").exists()
+
+        with connect() as conn:
+            page_count = conn.execute("SELECT COUNT(*) AS count FROM document_pages WHERE paper_id = ?", (paper_id,)).fetchone()["count"]
+            section_count = conn.execute("SELECT COUNT(*) AS count FROM document_sections WHERE paper_id = ?", (paper_id,)).fetchone()["count"]
+            chunk = conn.execute("SELECT * FROM paper_chunks WHERE paper_id = ? AND source_type IN ('text', 'section_summary') LIMIT 1", (paper_id,)).fetchone()
+            table_count = conn.execute("SELECT COUNT(*) AS count FROM document_tables WHERE paper_id = ?", (paper_id,)).fetchone()["count"]
+            figure_count = conn.execute("SELECT COUNT(*) AS count FROM document_figures WHERE paper_id = ?", (paper_id,)).fetchone()["count"]
+            figure = conn.execute("SELECT * FROM document_figures WHERE paper_id = ? LIMIT 1", (paper_id,)).fetchone()
+            figure_metadata = json.loads(figure["metadata_json"])
+            image_paths, image_context = collect_note_image_context(
+                conn,
+                paper_id,
+                [
+                    {
+                        "metadata": {
+                            "image_path": figure["image_path"],
+                            "page_image_path": figure_metadata["page_image_path"],
+                            "figure_ids": [figure["id"]],
+                        },
+                        "section_name": figure["section_path"],
+                        "page_start": figure["page_number"],
+                    }
+                ],
+            )
+        assert page_count == 3
+        assert section_count >= 2
+        assert chunk["section_path"]
+        assert chunk["page_start"] >= 1
+        assert chunk["context_prefix"]
+        assert table_count >= 1
+        assert figure_count >= 1
+        assert figure["image_path"]
+        assert (ROOT.parent / figure["image_path"]).exists()
+        assert (parsed_root / "pages" / "page_002.png").exists()
+        assert len(image_paths) >= 2
+        assert "Multimodal image attachments" in image_context
+
+
+def test_structured_retrieval_modes_for_page_table_and_method(tmp_path: Path) -> None:
+    with TestClient(app) as client:
+        pdf = make_multipage_pdf(
+            tmp_path,
+            "structured_modes.pdf",
+            [
+                "Structured Retrieval Paper\nTeam\n2026\nAbstract\nThis paper has structured evidence.",
+                "2 Method\nThe method builds section summaries and expands related figure evidence.\nFigure 1. Method flow diagram.",
+                "3 Experiments\nTable 1. Accuracy results.\nModel  Accuracy\nBase   0.70\nOurs   0.82",
+            ],
+        )
+        upload = post_pdf(client, pdf)
+        assert upload.status_code == 200
+        paper_id = upload.json()["current_paper"]["paper_id"]
+
+        table_chat = client.post(
+            "/api/chat/message",
+            json={
+                "message": "What does Table 1 show?",
+                "current_paper_id": paper_id,
+                "chat_scope": "paper_only",
+            },
+        )
+        assert table_chat.status_code == 200
+        table_execution = table_chat.json()["execution"]
+        assert table_execution["retrieval"]["retrieval_mode"] == "table_lookup"
+        assert table_execution["evidence_bundle"]["tables"]
+
+        page_chat = client.post(
+            "/api/chat/message",
+            json={
+                "message": "What does page 2 discuss?",
+                "current_paper_id": paper_id,
+                "chat_scope": "paper_only",
+            },
+        )
+        assert page_chat.status_code == 200
+        page_execution = page_chat.json()["execution"]
+        assert page_execution["retrieval"]["retrieval_mode"] == "page_lookup"
+        assert page_execution["retrieval"]["retrieved_pages"] == [2]
+
+        method_chat = client.post(
+            "/api/chat/message",
+            json={
+                "message": "Explain the method of this paper",
+                "current_paper_id": paper_id,
+                "chat_scope": "paper_only",
+            },
+        )
+        assert method_chat.status_code == 200
+        method_execution = method_chat.json()["execution"]
+        assert method_execution["retrieval"]["retrieval_mode"] == "complex_planned_retrieval"
+        assert method_execution["retrieval"]["legacy_mode"] == "complex_section_expansion"
+        assert method_execution["retrieval"]["retrieved_sections"]
+
+
+def test_codex_cli_provider_passes_image_arguments(tmp_path: Path, monkeypatch) -> None:
+    image = tmp_path / "figure.png"
+    image.write_bytes(b"fake-png")
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["input"] = kwargs.get("input")
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text("OK", encoding="utf-8")
+        return Completed()
+
+    monkeypatch.setattr("llm.codex_cli_client.subprocess.run", fake_run)
+    result = CodexCliClient().generate_text("describe the attached figure", image_paths=[str(image)])
+    assert result.ok
+    command = captured["command"]
+    assert "--image" in command
+    assert str(image.resolve()) in command
+    assert "describe the attached figure" in captured["input"]
+
+
 def test_chat_history_restores_messages_and_context(tmp_path: Path) -> None:
     with TestClient(app) as client:
         pdf = make_pdf(
@@ -291,3 +466,77 @@ def test_chat_history_restores_messages_and_context(tmp_path: Path) -> None:
         assert body["current_paper"]["id"] == paper_id
         assert body["current_folder_id"] == "folder_all"
         assert body["chat_scope"] == "paper_and_note"
+
+
+def test_search_filters_by_current_folder(tmp_path: Path) -> None:
+    with TestClient(app) as client:
+        now = now_iso()
+        with connect() as conn:
+            conn.execute(
+                "INSERT INTO folders (id, name, is_system, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                ("folder_search", "SearchFolder", 0, now, now),
+            )
+        folder_pdf = make_pdf(
+            tmp_path,
+            "folder_search.pdf",
+            "Unique Folder Search Paper\nAlice Test\n2026\nAbstract\nThis paper is only in a folder.",
+        )
+        library_pdf = make_pdf(
+            tmp_path,
+            "library_search.pdf",
+            "Unique Library Search Paper\nAlice Test\n2026\nAbstract\nThis paper is in the library.",
+        )
+        folder_upload = post_pdf(client, folder_pdf, folder_id="folder_search")
+        library_upload = post_pdf(client, library_pdf)
+        assert folder_upload.status_code == 200
+        assert library_upload.status_code == 200
+
+        folder_results = client.get("/api/papers/search", params={"keyword": "Unique", "folder_id": "folder_search"}).json()["papers"]
+        assert {item["id"] for item in folder_results} == {folder_upload.json()["current_paper"]["paper_id"]}
+
+
+def test_chat_sessions_store_separate_histories() -> None:
+    with TestClient(app) as client:
+        session_a = client.post("/api/chat/sessions", json={"title": "对话 A"}).json()["session"]
+        session_b = client.post("/api/chat/sessions", json={"title": "对话 B"}).json()["session"]
+
+        first = client.post(
+            "/api/chat/message",
+            json={"message": "session alpha question", "session_id": session_a["id"], "chat_scope": "global_library"},
+        )
+        second = client.post(
+            "/api/chat/message",
+            json={"message": "session beta question", "session_id": session_b["id"], "chat_scope": "global_library"},
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+
+        history_a = client.get("/api/chat/history", params={"session_id": session_a["id"]}).json()["messages"]
+        history_b = client.get("/api/chat/history", params={"session_id": session_b["id"]}).json()["messages"]
+        assert any(item["text"] == "session alpha question" for item in history_a)
+        assert not any(item["text"] == "session beta question" for item in history_a)
+        assert any(item["text"] == "session beta question" for item in history_b)
+
+
+def test_delete_chat_session_removes_history_and_returns_next_session() -> None:
+    with TestClient(app) as client:
+        session_a = client.post("/api/chat/sessions", json={"title": "待删除对话"}).json()["session"]
+        session_b = client.post("/api/chat/sessions", json={"title": "保留对话"}).json()["session"]
+        chat = client.post(
+            "/api/chat/message",
+            json={"message": "delete this session question", "session_id": session_a["id"], "chat_scope": "global_library"},
+        )
+        assert chat.status_code == 200
+
+        deleted = client.delete(f"/api/chat/sessions/{session_a['id']}")
+        assert deleted.status_code == 200
+        body = deleted.json()
+        assert body["deleted_tasks"] == 1
+        assert body["next_session_id"]
+
+        sessions = client.get("/api/chat/sessions").json()["sessions"]
+        assert session_a["id"] not in {item["id"] for item in sessions}
+        assert session_b["id"] in {item["id"] for item in sessions}
+
+        recreated_history = client.get("/api/chat/history", params={"session_id": session_a["id"]}).json()
+        assert recreated_history["messages"] == []

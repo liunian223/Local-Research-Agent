@@ -5,6 +5,8 @@ from typing import Any, Optional, TypedDict
 
 class AgentState(TypedDict, total=False):
     task_id: str
+    run_id: str
+    session_id: str
     user_input: str
     task_type: str
 
@@ -34,14 +36,27 @@ class AgentState(TypedDict, total=False):
     retrieved_chunks: list[dict[str, Any]]
     rag_evidence: list[dict[str, Any]]
     retrieve_meta: dict[str, Any]
+    retrieval: dict[str, Any]
+    rag_pipeline: dict[str, Any]
+    evidence_bundle: dict[str, Any]
 
     is_long_paper: bool
     section_summaries: dict[str, Any]
     note_plan: dict[str, Any]
+    note_generation: dict[str, Any]
+    note_generation_mode: str
+    note_evidence_bundle: dict[str, Any]
+    note_template_version: str
     partial_note_sections: dict[str, str]
     note_markdown: Optional[str]
     note_quality_check: dict[str, Any]
     note_repair_rounds: int
+    note_repair_log: list[dict[str, Any]]
+    note_id: Optional[str]
+    note_chunks: list[dict[str, Any]]
+    note_vector_status: str
+    obsidian_note_path: Optional[str]
+    obsidian_pdf_path: Optional[str]
 
     answer: Optional[str]
     message_type: str
@@ -55,3 +70,12 @@ class AgentState(TypedDict, total=False):
 
     status: str
     error: Optional[str]
+
+    harness: dict[str, Any]
+    harness_context: dict[str, Any]
+    policy_checks: list[dict[str, Any]]
+    tool_summary: dict[str, Any]
+    context_pack_strategy: str
+    redacted_fields: list[str]
+    execution_harness: dict[str, Any]
+    runtime_warnings: list[dict[str, Any]]

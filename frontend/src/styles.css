@@ -84,6 +84,10 @@ button:disabled {
   margin: 12px 0 8px;
 }
 
+.compact-title {
+  margin-top: 10px;
+}
+
 .row {
   display: flex;
   gap: 8px;
@@ -98,6 +102,16 @@ button:disabled {
 .folder-list {
   margin-top: 6px;
   margin-bottom: 8px;
+}
+
+.conversation-list {
+  gap: 6px;
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+.new-chat-button {
+  width: 100%;
 }
 
 .input,
@@ -125,7 +139,8 @@ button:disabled {
 }
 
 .folder,
-.paper {
+.paper,
+.conversation {
   width: 100%;
   text-align: left;
   height: auto;
@@ -134,9 +149,33 @@ button:disabled {
 }
 
 .folder.active,
-.paper.active {
+.paper.active,
+.conversation.active {
   border-color: #3a7c6b;
   background: #e8f2ee;
+}
+
+.conversation {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.conversation-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-meta {
+  flex: 0 0 auto;
+  color: #718096;
+  font-size: 12px;
+  line-height: 22px;
 }
 
 .paper-title {
@@ -289,6 +328,51 @@ button:disabled {
   border-radius: 6px;
   padding: 10px;
   white-space: pre-wrap;
+}
+
+.rag-summary,
+.coverage-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin: 8px 0 12px;
+}
+
+.rag-summary div,
+.coverage-list div {
+  border: 1px solid #dfe7e3;
+  border-radius: 6px;
+  padding: 8px;
+  background: #fbfcfc;
+}
+
+.rag-summary span,
+.coverage-list span {
+  display: block;
+  color: #66756f;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.rag-summary strong,
+.coverage-list strong {
+  color: #17231f;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.evidence-groups details {
+  border: 1px solid #e3e8e6;
+  border-radius: 6px;
+  margin: 8px 0;
+  padding: 8px;
+  background: #ffffff;
+}
+
+.evidence-groups summary {
+  cursor: pointer;
+  font-weight: 700;
+  color: #24342f;
 }
 
 @media (max-width: 820px) {

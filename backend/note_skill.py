@@ -107,33 +107,42 @@ source_pdf: "{paper.get('file_path')}"
 
 def run_deep_paper_note_skill(
     paper_metadata: dict[str, Any],
-    paper_text: str,
-    retrieved_chunks: list[dict[str, Any]],
+    evidence_bundle: dict[str, Any] | None = None,
+    paper_text: str = "",
+    retrieved_chunks: list[dict[str, Any]] | None = None,
     target_language: str = "zh",
+    options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     phases: list[dict[str, str]] = []
     fallbacks: list[dict[str, str]] = []
+    retrieved_chunks = retrieved_chunks or []
+    options = options or {}
 
-    phases.append({"name": "resolve_input", "status": "success", "summary": "Resolved paper metadata, parsed text, and retrieved chunks."})
+    phases.append({"name": "resolve_input", "status": "success", "summary": "Resolved paper metadata, structured evidence, parsed text fallback, and retrieved chunks."})
     phases.append({"name": "detect_language", "status": "success", "summary": f"Detected language={paper_metadata.get('language') or 'unknown'}; target_language={target_language}."})
-    section_summaries = summarize_sections(paper_text, retrieved_chunks)
+    note_evidence_bundle = normalize_note_evidence_bundle(evidence_bundle or {}, retrieved_chunks)
+    if not evidence_bundle:
+        fallbacks.append({"type": "missing_evidence_bundle", "message": "Built note evidence bundle from flat retrieved chunks or parsed text fallback."})
+    phases.append({"name": "normalize_evidence_bundle", "status": "success", "summary": f"Normalized {sum(len(value) for value in note_evidence_bundle.values() if isinstance(value, list))} grouped evidence items."})
+    flat_evidence = note_evidence_bundle["evidence_blocks"] or build_evidence_bundle(retrieved_chunks, paper_text)
+    section_summaries = summarize_sections(paper_text, flat_evidence)
     phases.append({"name": "normalize_sections", "status": "success", "summary": f"Normalized {len(section_summaries)} section summaries."})
-    evidence_bundle = build_evidence_bundle(retrieved_chunks, paper_text)
-    phases.append({"name": "build_evidence_bundle", "status": "success", "summary": f"Built evidence bundle with {len(evidence_bundle)} items."})
 
-    is_long = is_long_paper(paper_metadata, paper_text, retrieved_chunks)
-    note_plan = build_note_plan(evidence_bundle)
+    is_long = is_long_paper(paper_metadata, paper_text, flat_evidence)
+    note_mode = options.get("note_mode") or ("long_paper" if is_long else "normal")
+    template_version = options.get("template_version") or "obsidian_note_v2"
+    note_plan = build_note_plan(flat_evidence)
     phases.append({"name": "generate_note_plan", "status": "success", "summary": "Generated required Obsidian note plan."})
 
     if is_long:
         fallbacks.append({"type": "long_paper_staged_generation", "message": "Long paper detected; generated note in staged sections."})
         phases.append({"name": "section_summary", "status": "success", "summary": "Created staged section summaries for long paper handling."})
-        partial_sections = generate_partial_note_sections(paper_metadata, section_summaries, evidence_bundle, note_plan)
+        partial_sections = generate_partial_note_sections(paper_metadata, section_summaries, flat_evidence, note_plan)
         phases.append({"name": "section_note_generation", "status": "success", "summary": f"Generated {len(partial_sections)} partial note sections."})
-        markdown = merge_note_sections(paper_metadata, partial_sections, evidence_bundle)
+        markdown = merge_note_sections(paper_metadata, partial_sections, flat_evidence)
         phases.append({"name": "note_merge", "status": "success", "summary": "Merged partial sections into one Markdown note."})
     else:
-        markdown, _, template_phases = build_note_markdown(paper_metadata, retrieved_chunks, paper_text)
+        markdown, _, template_phases = build_note_markdown_from_bundle(paper_metadata, note_evidence_bundle, paper_text)
         partial_sections = {}
         phases.extend({"name": item["name"], "status": item["status"], "summary": item["summary"]} for item in template_phases)
         phases.append({"name": "generate_sections", "status": "success", "summary": "Generated complete note in one local pass."})
@@ -143,16 +152,19 @@ def run_deep_paper_note_skill(
     phases.append({"name": "quality_check", "status": "success" if quality["ok"] else "partial", "summary": f"Missing sections: {len(quality['missing_sections'])}."})
     repaired = False
     repair_rounds = 0
-    while not quality["ok"] and repair_rounds < config.MAX_NOTE_REPAIR_ROUNDS:
+    max_repair_rounds = int(options.get("max_repair_rounds", config.MAX_NOTE_REPAIR_ROUNDS))
+    repair_log: list[dict[str, Any]] = []
+    while not quality["ok"] and repair_rounds < max_repair_rounds:
         repair_rounds += 1
-        markdown = repair_missing_sections(markdown, paper_metadata, quality["missing_sections"], evidence_bundle)
+        repair_log.append({"round": repair_rounds, "missing_sections": list(quality["missing_sections"])})
+        markdown = repair_missing_sections(markdown, paper_metadata, quality["missing_sections"], flat_evidence)
         repaired = True
         quality = detailed_quality_check(markdown)
     if repaired:
         phases.append({"name": "repair_if_needed", "status": "success" if quality["ok"] else "partial", "summary": f"Repair rounds: {repair_rounds}."})
     if not quality["ok"]:
         fallbacks.append({"type": "partial_note_fallback", "message": "Generated partial note because some required sections remain incomplete."})
-        markdown = partial_note_fallback(paper_metadata, paper_text, evidence_bundle, quality["missing_sections"])
+        markdown = partial_note_fallback(paper_metadata, paper_text, flat_evidence, quality["missing_sections"])
         quality = detailed_quality_check(markdown)
         phases.append({"name": "partial_note_fallback", "status": "success", "summary": "Generated degraded structured note."})
 
@@ -163,13 +175,106 @@ def run_deep_paper_note_skill(
         "quality_check": {
             **quality,
             "long_paper": is_long,
+            "note_generation_mode": note_mode,
+            "template_version": template_version,
             "section_summaries": section_summaries,
             "note_plan": note_plan,
             "partial_note_section_keys": list(partial_sections.keys()) if is_long else [],
             "repair_rounds": repair_rounds,
+            "repair_log": repair_log,
+            "evidence_group_counts": {key: len(value) for key, value in note_evidence_bundle.items() if isinstance(value, list)},
         },
         "fallbacks": fallbacks,
+        "note_evidence_bundle": note_evidence_bundle,
     }
+
+
+def normalize_note_evidence_bundle(
+    evidence_bundle: dict[str, Any],
+    retrieved_chunks: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    retrieved_chunks = retrieved_chunks or []
+    normalized: dict[str, Any] = {
+        "basic_info": {},
+        "abstract": [],
+        "background": [],
+        "research_problem": [],
+        "method": [],
+        "technical_details": [],
+        "experiment": [],
+        "result": [],
+        "discussion": [],
+        "conclusion": [],
+        "limitations": [],
+        "tables": list(evidence_bundle.get("tables") or []),
+        "figures": list(evidence_bundle.get("figures") or []),
+        "pages": list(evidence_bundle.get("pages") or []),
+        "section_summaries": list(evidence_bundle.get("section_summaries") or []),
+        "note_evidence": [],
+        "evidence_blocks": [],
+        "warnings": list(evidence_bundle.get("warnings") or []),
+        "fallbacks": list(evidence_bundle.get("fallbacks") or []),
+    }
+    sources: list[dict[str, Any]] = []
+    for key in ["text_chunks", "section_summaries", "abstract_chunks", "tables", "figures", "pages"]:
+        for item in evidence_bundle.get(key) or []:
+            sources.append({**item, "bundle_group": key})
+    if not sources:
+        sources = list(retrieved_chunks)
+    for item in sources:
+        bucket = note_evidence_bucket(item)
+        normalized.setdefault(bucket, []).append(item)
+        normalized["evidence_blocks"].append(item)
+    return normalized
+
+
+def note_evidence_bucket(item: dict[str, Any]) -> str:
+    metadata = item.get("metadata") or {}
+    source_type = str(item.get("source_type") or metadata.get("source_type") or "").lower()
+    role = str(item.get("section_role") or item.get("chunk_role") or metadata.get("section_role") or metadata.get("chunk_role") or "").lower()
+    text = f"{item.get('section_name', '')} {item.get('section_path', '')} {item.get('text', '')[:300]}".lower()
+    if source_type == "note":
+        return "note_evidence"
+    if source_type == "table":
+        return "tables"
+    if source_type == "figure":
+        return "figures"
+    if source_type == "page_summary":
+        return "pages"
+    if item.get("is_abstract") or metadata.get("is_abstract") or role == "abstract":
+        return "abstract"
+    if any(token in role or token in text for token in ["introduction", "background", "related", "引言", "背景"]):
+        return "background"
+    if any(token in role or token in text for token in ["method", "approach", "model", "framework", "方法", "模型"]):
+        return "method"
+    if any(token in role or token in text for token in ["experiment", "evaluation", "dataset", "ablation", "实验", "评测", "数据集"]):
+        return "experiment"
+    if any(token in role or token in text for token in ["result", "performance", "metric", "结果", "指标"]):
+        return "result"
+    if any(token in role or token in text for token in ["limitation", "discussion", "局限", "讨论"]):
+        return "limitations"
+    if any(token in role or token in text for token in ["conclusion", "结论"]):
+        return "conclusion"
+    if source_type == "section_summary":
+        return "discussion"
+    return "technical_details"
+
+
+def build_note_markdown_from_bundle(paper: dict[str, Any], note_bundle: dict[str, Any], full_text: str) -> tuple[str, dict[str, Any], list[dict[str, str]]]:
+    evidence = note_bundle.get("evidence_blocks") or []
+    markdown, quality, phases = build_note_markdown(paper, evidence, full_text)
+    method_available = bool(note_bundle.get("method"))
+    experiment_available = bool(note_bundle.get("experiment") or note_bundle.get("tables"))
+    result_available = bool(note_bundle.get("result") or note_bundle.get("tables"))
+    warnings = []
+    if note_bundle.get("abstract") and not method_available:
+        warnings.append("正文方法证据不足，摘要只作为全文概览线索，不能替代方法证据。")
+    if note_bundle.get("abstract") and not (experiment_available or result_available):
+        warnings.append("正文实验/结果证据不足，摘要不能作为实验结论的强证据。")
+    if warnings:
+        markdown = markdown.replace("## 5. 鏂规硶姒傝堪", "## 5. 鏂规硶姒傝堪\n" + "\n".join(f"- {item}" for item in warnings) + "\n", 1)
+    phases.append({"name": "apply_abstract_rules", "status": "success", "summary": f"Applied abstract evidence rules; warnings={len(warnings)}."})
+    return markdown, quality, phases
 
 
 def is_long_paper(paper: dict[str, Any], full_text: str, chunks: list[dict[str, Any]]) -> bool:

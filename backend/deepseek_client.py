@@ -102,8 +102,17 @@ def build_rag_answer_prompt(question: str, evidence: list[dict[str, Any]]) -> li
     evidence_lines = []
     for item in evidence[: config.MAX_EVIDENCE_ITEMS]:
         text = (item.get("text") or "")[: config.MAX_EVIDENCE_CHARS]
+        location = item.get("section_path") or item.get("section_name") or "Body"
+        pages = ""
+        if item.get("page_start"):
+            pages = f" pages={item.get('page_start')}-{item.get('page_end') or item.get('page_start')}"
+        prefix = item.get("context_prefix") or ""
+        metadata = item.get("metadata") or {}
+        abstract_flag = bool(item.get("is_abstract") or metadata.get("is_abstract"))
+        role = item.get("chunk_role") or metadata.get("chunk_role") or ""
         evidence_lines.append(
-            f"[{item.get('rank')}] source={item.get('source_type')} section={item.get('section_name')}\n{text}"
+            f"[{item.get('rank')}] source={item.get('source_type')} section={location}{pages} "
+            f"is_abstract={str(abstract_flag).lower()} chunk_role={role}\n{prefix}\n{text}"
         )
     evidence_text = "\n\n".join(evidence_lines)
     return [
@@ -111,7 +120,9 @@ def build_rag_answer_prompt(question: str, evidence: list[dict[str, Any]]) -> li
             "role": "system",
             "content": (
                 "You are the Note Skill Agent in Local Research Agent. Answer in Chinese. "
-                "Use only the provided local RAG evidence. If evidence is insufficient, say so clearly."
+                "Use only the provided local RAG evidence. If evidence is insufficient, say so clearly. "
+                "If evidence is marked is_abstract=true, treat it only as a high-level clue unless the user explicitly asks about the abstract or a whole-paper summary. "
+                "Do not use abstract evidence as a substitute for concrete method, experiment, or result evidence."
             ),
         },
         {
@@ -121,12 +132,22 @@ def build_rag_answer_prompt(question: str, evidence: list[dict[str, Any]]) -> li
     ]
 
 
+def build_rag_answer_prompt_text(question: str, evidence: list[dict[str, Any]]) -> tuple[str, str]:
+    messages = build_rag_answer_prompt(question, evidence)
+    return messages[0]["content"], messages[1]["content"]
+
+
 def build_note_generation_prompt(paper: dict[str, Any], evidence: list[dict[str, Any]], full_text: str) -> list[dict[str, str]]:
     evidence_lines = []
     for item in evidence[: config.MAX_EVIDENCE_ITEMS]:
         text = (item.get("text") or "")[: config.MAX_EVIDENCE_CHARS]
+        location = item.get("section_path") or item.get("section_name") or "Body"
+        pages = ""
+        if item.get("page_start"):
+            pages = f" pages={item.get('page_start')}-{item.get('page_end') or item.get('page_start')}"
+        prefix = item.get("context_prefix") or ""
         evidence_lines.append(
-            f"[{item.get('rank')}] source={item.get('source_type')} section={item.get('section_name')}\n{text}"
+            f"[{item.get('rank')}] source={item.get('source_type')} section={location}{pages}\n{prefix}\n{text}"
         )
     context = full_text[: config.MAX_CONTEXT_CHARS_PER_LLM_CALL]
     title = paper.get("title") or "Untitled Paper"
@@ -175,3 +196,8 @@ Parsed text excerpt, truncated safely:
 """,
         },
     ]
+
+
+def build_note_generation_prompt_text(paper: dict[str, Any], evidence: list[dict[str, Any]], full_text: str) -> tuple[str, str]:
+    messages = build_note_generation_prompt(paper, evidence, full_text)
+    return messages[0]["content"], messages[1]["content"]

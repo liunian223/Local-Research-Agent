@@ -17,6 +17,10 @@ def retrieve_chunks(query: str, rows: list[dict[str, Any]]) -> tuple[list[dict[s
     return VECTOR_STORE.retrieve(query, rows)
 
 
+def adaptive_retrieve(query: str, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    return VECTOR_STORE.retrieve(query, rows)
+
+
 retrieve_note_blocks = retrieve_chunks
 retrieve_paper_and_note = retrieve_chunks
 retrieve_global_knowledge = retrieve_chunks

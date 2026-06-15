@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Optional
 
@@ -10,14 +11,22 @@ from pydantic import BaseModel
 import config
 from agents.knowledge_rag_agent import knowledge_rag_agent_node
 from agents.note_skill_agent import note_skill_agent_node
-from deepseek_client import build_note_generation_prompt, build_rag_answer_prompt, get_deepseek_client
+from chat_sessions import create_session, delete_session, ensure_session, get_history, list_sessions, touch_session
+from deepseek_client import build_note_generation_prompt_text, build_rag_answer_prompt_text
 from database import connect, init_db, log_a2a, log_mcp, log_trace, new_id, now_iso, row_to_dict, rows_to_dicts
-from graph.builder import run_graph
+from graph.builder import initial_phase, run_graph
 from graph.state import AgentState
-from graph_runtime import initial_phase, standard_flow, validate_node_visits
+from harness.context_manager import context_pack_strategy
+from harness.runtime import RuntimeTaskError, run_chat_task, run_upload_task
+from layout_parser import parse_pdf_layout, save_layout_artifacts
+from llm.model_gateway import get_model_gateway
+from mcp_servers.database_mcp_server import delete_paper_artifacts, insert_chunks, insert_note, insert_note_chunks, insert_paper, update_paper_status
+from mcp_servers.file_mcp_server import copy_pdf_to_obsidian, read_pdf_text, save_uploaded_pdf, write_markdown_note
 from note_skill import check_required_note_sections, quality_json, run_deep_paper_note_skill, safe_obsidian_attachment_path, safe_obsidian_path
-from pdf_tools import extract_metadata, extract_text_with_fallback, safe_filename, sha256_bytes
+from pdf_tools import extract_metadata, safe_filename, sha256_bytes
 from rag import note_to_chunks, split_chunks
+from semantic_chunker import build_semantic_chunks
+from structured_retriever import build_evidence_bundle, collect_structured_scope_chunks, retrieve_structured_evidence
 from tool_gateway import ToolGateway
 from vector_store import VECTOR_STORE
 
@@ -36,7 +45,12 @@ class ChatMessage(BaseModel):
     message: str
     current_paper_id: Optional[str] = None
     current_folder_id: Optional[str] = "folder_all"
+    session_id: Optional[str] = "session_default"
     chat_scope: str = "paper_and_note"
+
+
+class ChatSessionCreate(BaseModel):
+    title: str = "新对话"
 
 
 def api_error(status: int, code: str, message: str) -> HTTPException:
@@ -58,8 +72,12 @@ def startup() -> None:
 
 
 @app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "project": config.PROJECT_NAME}
+def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "project": config.PROJECT_NAME,
+        "model_execution": get_model_gateway().model_execution_info(),
+    }
 
 
 @app.get("/api/folders")
@@ -100,13 +118,19 @@ def list_papers(folder_id: str = "folder_all") -> dict[str, Any]:
 
 
 @app.get("/api/papers/search")
-def search_papers(keyword: str = "") -> dict[str, Any]:
+def search_papers(keyword: str = "", folder_id: str = "folder_all") -> dict[str, Any]:
     like = f"%{keyword.strip()}%"
     with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM papers WHERE title LIKE ? OR authors LIKE ? ORDER BY created_at DESC",
-            (like, like),
-        ).fetchall()
+        if folder_id == "folder_all":
+            rows = conn.execute(
+                "SELECT * FROM papers WHERE title LIKE ? OR authors LIKE ? ORDER BY created_at DESC",
+                (like, like),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM papers WHERE folder_id = ? AND (title LIKE ? OR authors LIKE ?) ORDER BY created_at DESC",
+                (folder_id, like, like),
+            ).fetchall()
         papers = papers_with_notes(conn, rows)
     return {"papers": papers}
 
@@ -127,8 +151,9 @@ def delete_paper(paper_id: str) -> dict[str, Any]:
         paper = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not paper:
             raise api_error(404, "paper_not_found", "Paper not found.")
-        deleted_papers = delete_papers(conn, [paper_dict(paper)])
-    return {"status": "deleted", "deleted_papers": deleted_papers}
+        vector_cleanup: list[dict[str, Any]] = []
+        deleted_papers = delete_papers(conn, [paper_dict(paper)], vector_cleanup)
+    return {"status": "deleted", "deleted_papers": deleted_papers, "vector_cleanup": vector_cleanup}
 
 
 def safe_unlink(path: str | Path | None, roots: list[Path]) -> bool:
@@ -161,113 +186,62 @@ def cleanup_paths_for_paper(paper: dict[str, Any]) -> list[Path]:
     return paths
 
 
-def delete_papers(conn: Any, papers: list[dict[str, Any]]) -> int:
+def delete_papers(conn: Any, papers: list[dict[str, Any]], vector_cleanup_results: list[dict[str, Any]] | None = None) -> int:
     if not papers:
         return 0
     paper_ids = [paper["id"] for paper in papers]
     placeholders = ",".join("?" for _ in paper_ids)
     roots = [config.PAPER_DIR, config.PARSED_DIR, config.OBSIDIAN_VAULT_PATH]
+    note_ids = [
+        row["id"]
+        for row in conn.execute(f"SELECT id FROM reading_notes WHERE paper_id IN ({placeholders})", paper_ids).fetchall()
+    ]
+    for paper in papers:
+        try:
+            result = VECTOR_STORE.delete_by_paper_id(paper["id"])
+        except Exception as exc:
+            result = {"backend": getattr(VECTOR_STORE, "backend", "unknown"), "status": "failed", "paper_id": paper["id"], "error": str(exc)[:300]}
+        if vector_cleanup_results is not None:
+            vector_cleanup_results.append({"target": "paper", "id": paper["id"], **result})
+    for note_id in note_ids:
+        try:
+            result = VECTOR_STORE.delete_by_note_id(note_id)
+        except Exception as exc:
+            result = {"backend": getattr(VECTOR_STORE, "backend", "unknown"), "status": "failed", "note_id": note_id, "error": str(exc)[:300]}
+        if vector_cleanup_results is not None:
+            vector_cleanup_results.append({"target": "note", "id": note_id, **result})
     for paper in papers:
         for path in cleanup_paths_for_paper(paper):
             safe_unlink(path, roots)
-    conn.execute(f"DELETE FROM note_chunks WHERE paper_id IN ({placeholders})", paper_ids)
-    conn.execute(f"DELETE FROM reading_notes WHERE paper_id IN ({placeholders})", paper_ids)
-    conn.execute(f"DELETE FROM paper_chunks WHERE paper_id IN ({placeholders})", paper_ids)
-    conn.execute(f"DELETE FROM papers WHERE id IN ({placeholders})", paper_ids)
-    conn.execute(f"UPDATE agent_tasks SET current_paper_id = NULL WHERE current_paper_id IN ({placeholders})", paper_ids)
+    delete_paper_artifacts(conn, paper_ids)
     return len(paper_ids)
 
 
 def collect_scope_chunks(conn: Any, scope: str, paper_id: str | None) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    if scope in {"paper_only", "paper_and_note"}:
-        if paper_id:
-            paper_rows = conn.execute("SELECT *, 'paper' AS source_type FROM paper_chunks WHERE paper_id = ?", (paper_id,)).fetchall()
-        else:
-            paper_rows = conn.execute("SELECT *, 'paper' AS source_type FROM paper_chunks").fetchall()
-        rows.extend(rows_to_dicts(paper_rows))
-    if scope in {"note_only", "paper_and_note"}:
-        if paper_id:
-            note_rows = conn.execute("SELECT *, 'note' AS source_type FROM note_chunks WHERE paper_id = ?", (paper_id,)).fetchall()
-        else:
-            note_rows = conn.execute("SELECT *, 'note' AS source_type FROM note_chunks").fetchall()
-        rows.extend(rows_to_dicts(note_rows))
-    if scope == "global_library":
-        rows.extend(rows_to_dicts(conn.execute("SELECT *, 'paper' AS source_type FROM paper_chunks").fetchall()))
-        rows.extend(rows_to_dicts(conn.execute("SELECT *, 'note' AS source_type FROM note_chunks").fetchall()))
-    return rows
+    return collect_structured_scope_chunks(conn, scope, paper_id)
 
 
-def execution_from(conn: Any, task_id: str, evidence: list[dict[str, Any]], skill_phases: list[dict[str, Any]], fallbacks: list[str]) -> dict[str, Any]:
-    traces = rows_to_dicts(conn.execute("SELECT * FROM agent_traces WHERE task_id = ? ORDER BY step_index ASC", (task_id,)).fetchall())
-    mcp = rows_to_dicts(conn.execute("SELECT * FROM mcp_tool_calls WHERE task_id = ? ORDER BY created_at ASC", (task_id,)).fetchall())
-    a2a = rows_to_dicts(conn.execute("SELECT * FROM a2a_messages WHERE task_id = ? ORDER BY created_at ASC", (task_id,)).fetchall())
-    task = row_to_dict(conn.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()) or {}
-    visited = [trace["node_name"] for trace in traces]
-    visits_ok, visits_error = validate_node_visits(visited)
-    return {
-        "graph_state": {
-            "task_type": task.get("task_type"),
-            "initial_phase": initial_phase(task.get("task_type", "")),
-            "standard_flow": standard_flow(task.get("task_type", "")),
-            "node_visit_limit_ok": visits_ok,
-            "node_visit_limit_error": visits_error,
-        },
-        "langgraph_nodes": traces,
-        "mcp_tool_calls": mcp,
-        "a2a_messages": a2a,
-        "skill_phases": skill_phases,
-        "rag_evidence": evidence,
-        "fallbacks": fallbacks,
-    }
+@app.get("/api/chat/sessions")
+def list_chat_sessions() -> dict[str, Any]:
+    return list_sessions()
 
 
-def history_message_text(task: dict[str, Any]) -> str:
-    if task.get("user_input"):
-        return task["user_input"]
-    if task.get("task_type") in {"import_paper", "import_and_note"}:
-        return "上传 PDF"
-    return ""
+@app.post("/api/chat/sessions")
+def create_chat_session(payload: ChatSessionCreate) -> dict[str, Any]:
+    return create_session(payload.title)
+
+
+@app.delete("/api/chat/sessions/{session_id}")
+def delete_chat_session(session_id: str) -> dict[str, Any]:
+    result = delete_session(session_id)
+    if result is None:
+        raise api_error(404, "session_not_found", "Chat session not found.")
+    return result
 
 
 @app.get("/api/chat/history")
-def chat_history(limit: int = 50) -> dict[str, Any]:
-    limit = max(1, min(limit, 200))
-    with connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM agent_tasks
-            WHERE status = 'done'
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-        tasks = list(reversed(rows_to_dicts(rows)))
-        messages: list[dict[str, Any]] = []
-        for task in tasks:
-            user_text = history_message_text(task)
-            if user_text:
-                messages.append({"role": "user", "text": user_text, "task_id": task["id"]})
-            if task.get("answer"):
-                messages.append({"role": "assistant", "text": task["answer"], "task_id": task["id"]})
-
-        latest = tasks[-1] if tasks else {}
-        paper = None
-        if latest.get("current_paper_id"):
-            paper = row_to_dict(conn.execute("SELECT * FROM papers WHERE id = ?", (latest["current_paper_id"],)).fetchone())
-            if paper:
-                note = conn.execute(
-                    "SELECT id, obsidian_path, created_at, updated_at FROM reading_notes WHERE paper_id = ? ORDER BY created_at DESC LIMIT 1",
-                    (paper["id"],),
-                ).fetchone()
-                paper["latest_note"] = row_to_dict(note)
-    return {
-        "messages": messages,
-        "current_paper": paper,
-        "current_folder_id": latest.get("current_folder_id") or (paper.get("folder_id") if paper else "folder_all"),
-        "chat_scope": latest.get("chat_scope") or "paper_and_note",
-    }
+def chat_history(limit: int = 50, session_id: str = "session_default") -> dict[str, Any]:
+    return get_history(limit, session_id)
 
 
 def has_partial_note_fallback(fallbacks: list[Any]) -> bool:
@@ -276,6 +250,21 @@ def has_partial_note_fallback(fallbacks: list[Any]) -> bool:
         or item in {"partial_note_fallback", "long_paper_staged_generation"}
         for item in fallbacks
     )
+
+
+def remove_local_note_generation_fallbacks(fallbacks: list[Any]) -> list[Any]:
+    local_note_fallbacks = {
+        "partial_note_fallback",
+        "long_paper_staged_generation",
+    }
+    return [
+        item
+        for item in fallbacks
+        if not (
+            (isinstance(item, dict) and item.get("type") in local_note_fallbacks)
+            or item in local_note_fallbacks
+        )
+    ]
 
 
 def task_type_from_message(message: str, has_upload: bool = False) -> str:
@@ -303,48 +292,118 @@ def task_type_from_message(message: str, has_upload: bool = False) -> str:
 
 
 def retrieve_evidence(gateway: ToolGateway, conn: Any, scope: str, paper_id: str | None, query: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    rows = collect_scope_chunks(conn, scope, paper_id)
     return gateway.invoke(
         "Knowledge RAG Agent",
         "rag",
-        "retrieve_chunks",
-        VECTOR_STORE.retrieve,
+        "adaptive_retrieve" if config.RAG_ADAPTIVE_ENABLED else "retrieve_structured_evidence",
+        retrieve_structured_evidence,
+        conn,
+        scope,
+        paper_id,
         query,
-        rows,
         input_summary=f"scope={scope}; paper_id={paper_id or ''}",
-        output_summarizer=lambda value: f"{len(value[0])} evidence chunks returned by {value[1].get('backend')}",
+        output_summarizer=lambda value: f"{len(value[0])} evidence chunks returned by {value[1].get('backend')}; mode={value[1].get('retrieval_mode')}",
     )
 
 
 def synthesize_answer_with_optional_llm(gateway: ToolGateway, task_id: str, question: str, evidence: list[dict[str, Any]], fallbacks: list[str]) -> str:
     if not evidence:
         fallbacks.append("no_matching_evidence")
-        return "没有检索到足够相关的 evidence。你可以先导入 PDF，或切换到全知识库范围后再提问。"
+        return "没有检索到可引用的 evidence。请先确认 PDF 已成功解析并完成索引，或换一个更具体的问题再试。"
 
-    client = get_deepseek_client()
-    if client is None:
-        fallbacks.append("deepseek_api_key_missing_local_rag_answer_used")
-        bullets = "\n".join(f"- {item['section_name']}: {item['text'][:220]}" for item in evidence[:3])
-        return (
-            "基于当前范围的本地 evidence，初步回答如下：\n"
-            f"{bullets}\n\n"
-            "这是离线 RAG 兜底回答；配置 DEEPSEEK_API_KEY 后可接入 DeepSeek 生成更完整的综合回答。"
-        )
-
-    result = client.chat(
-        build_rag_answer_prompt(question, evidence),
-        model=config.DEEPSEEK_MODEL_CHAT,
+    model_gateway = get_model_gateway()
+    system, prompt = build_rag_answer_prompt_text(question, evidence)
+    result = model_gateway.generate_text(
+        prompt,
+        system=system,
+        purpose="chat",
         temperature=0.2,
-        max_tokens=1600,
+        max_output_tokens=1600,
     )
     if result.ok:
-        log_mcp(gateway.conn, task_id, "llm", "deepseek_chat", result.model, result.usage_summary or "DeepSeek answer generated.")
+        log_mcp(gateway.conn, task_id, "llm", "model_chat", result.model, result.usage_summary or "Model answer generated.")
         return result.content
 
-    fallbacks.append("deepseek_chat_failed_local_rag_answer_used")
-    log_mcp(gateway.conn, task_id, "llm", "deepseek_chat", result.model, "DeepSeek call failed.", status="error", error=result.error)
+    fallbacks.append("model_chat_failed_local_rag_answer_used")
+    log_mcp(gateway.conn, task_id, "llm", "model_chat", result.model, "Model call failed.", status="error", error=result.error)
     bullets = "\n".join(f"- {item['section_name']}: {item['text'][:220]}" for item in evidence[:3])
-    return f"DeepSeek 调用失败，已使用本地 RAG 兜底回答：\n{bullets}"
+    return f"模型调用失败，已使用本地 RAG 兜底回答：\n{bullets}"
+
+
+def collect_note_image_context(conn: Any, paper_id: str, evidence: list[dict[str, Any]], limit: int | None = None) -> tuple[list[str], str]:
+    limit = limit or config.MAX_NOTE_IMAGE_ATTACHMENTS
+    selected: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+
+    def add_item(path: str, label: str, caption: str = "", page: Any = None, source: str = "") -> None:
+        if not path:
+            return
+        resolved = Path(path)
+        if not resolved.is_absolute():
+            resolved = config.ROOT_DIR / resolved
+        if not resolved.exists() or not resolved.is_file():
+            return
+        key = str(resolved.resolve()).lower()
+        if key in seen_paths:
+            return
+        seen_paths.add(key)
+        selected.append(
+            {
+                "path": str(resolved),
+                "label": label,
+                "caption": caption,
+                "page": page,
+                "source": source,
+            }
+        )
+
+    for item in evidence:
+        metadata = item.get("metadata") or {}
+        figure = metadata.get("figure") if isinstance(metadata.get("figure"), dict) else {}
+        figure_ids = metadata.get("figure_ids") or []
+        figure_label = figure.get("figure_id") or (figure_ids[0] if figure_ids else "figure")
+        add_item(
+            metadata.get("image_path") or figure.get("image_path") or "",
+            label=figure_label,
+            caption=figure.get("caption") or item.get("section_name") or "",
+            page=item.get("page_start") or figure.get("page_number"),
+            source="retrieved_figure",
+        )
+        add_item(
+            metadata.get("page_image_path") or figure.get("page_image_path") or "",
+            label=f"page_{item.get('page_start') or figure.get('page_number') or ''}",
+            caption=figure.get("caption") or item.get("section_name") or "",
+            page=item.get("page_start") or figure.get("page_number"),
+            source="retrieved_page",
+        )
+        if len(selected) >= limit:
+            break
+
+    if len(selected) < limit:
+        rows = conn.execute(
+            """
+            SELECT * FROM document_figures
+            WHERE paper_id = ? AND COALESCE(image_path, '') <> ''
+            ORDER BY page_number ASC, id ASC
+            LIMIT ?
+            """,
+            (paper_id, limit * 2),
+        ).fetchall()
+        for row in rows_to_dicts(rows):
+            metadata = json.loads(row.get("metadata_json") or "{}")
+            add_item(row.get("image_path") or "", row.get("id") or "figure", row.get("caption") or "", row.get("page_number"), "paper_figure")
+            add_item(metadata.get("page_image_path") or "", f"page_{row.get('page_number')}", row.get("caption") or "", row.get("page_number"), "paper_page")
+            if len(selected) >= limit:
+                break
+
+    image_paths = [item["path"] for item in selected[:limit]]
+    if not selected:
+        return [], ""
+    lines = [
+        f"- [{idx}] {item['label']} page={item.get('page') or ''} source={item['source']} caption={item['caption']} path={item['path']}"
+        for idx, item in enumerate(selected[:limit], start=1)
+    ]
+    return image_paths, "Multimodal image attachments available to the model:\n" + "\n".join(lines)
 
 
 def ingest_pdf(conn: Any, gateway: ToolGateway, task_id: str, file_bytes: bytes, original_name: str, folder_id: str) -> tuple[dict[str, Any], list[str]]:
@@ -364,7 +423,8 @@ def ingest_pdf(conn: Any, gateway: ToolGateway, task_id: str, file_bytes: bytes,
         "Knowledge RAG Agent",
         "file",
         "save_uploaded_pdf",
-        target.write_bytes,
+        save_uploaded_pdf,
+        target,
         file_bytes,
         input_summary=original_name,
         output_summarizer=lambda value: str(target),
@@ -374,7 +434,7 @@ def ingest_pdf(conn: Any, gateway: ToolGateway, task_id: str, file_bytes: bytes,
         "Knowledge RAG Agent",
         "file",
         "read_pdf_text",
-        extract_text_with_fallback,
+        read_pdf_text,
         target,
         input_summary=str(target),
         output_summarizer=lambda value: f"parser={value['parser']}; chars={len(value['text'])}; pages={value['page_count']}",
@@ -426,27 +486,42 @@ def ingest_pdf(conn: Any, gateway: ToolGateway, task_id: str, file_bytes: bytes,
         "created_at": now,
         "updated_at": now,
     }
-    conn.execute(
-        """
-        INSERT INTO papers
-        (id, title, authors, year, language, doi, file_path, file_name, file_sha256, page_count, folder_id,
-         parse_status, vector_status, note_status, obsidian_note_path, metadata_source, metadata_confidence,
-         metadata_warning, parse_warning, created_at, updated_at)
-        VALUES
-        (:id, :title, :authors, :year, :language, :doi, :file_path, :file_name, :file_sha256, :page_count, :folder_id,
-         :parse_status, :vector_status, :note_status, :obsidian_note_path, :metadata_source, :metadata_confidence,
-         :metadata_warning, :parse_warning, :created_at, :updated_at)
-        """,
+    gateway.invoke(
+        "Knowledge RAG Agent",
+        "database",
+        "insert_paper",
+        insert_paper,
+        conn,
         paper,
+        input_summary=f"paper_id={paper_id}; title={paper['title']}",
+        output_summarizer=lambda value: f"title={value['title']}; parse_status={value['parse_status']}",
     )
-    log_mcp(conn, task_id, "database", "insert_paper", paper_id, f"title={paper['title']}; parse_status={parse_status}")
 
-    chunks = split_chunks(parsed["text"], metadata["language"]) if parsed["text"] else []
-    for chunk in chunks:
-        conn.execute(
-            "INSERT INTO paper_chunks (id, paper_id, section_name, chunk_index, text, vector_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (chunk["id"], paper_id, chunk["section_name"], chunk["chunk_index"], chunk["text"], chunk["id"], now_iso()),
-        )
+    document = gateway.invoke(
+        "Knowledge RAG Agent",
+        "rag",
+        "parse_layout_document",
+        parse_pdf_layout,
+        target,
+        paper,
+        parsed["text"],
+        input_summary=f"paper_id={paper_id}; parser={parsed['parser']}",
+        output_summarizer=lambda value: f"pages={len(value.get('pages', []))}; sections={len(value.get('sections', []))}; tables={len(value.get('tables', []))}; figures={len(value.get('figures', []))}",
+    )
+    chunks = build_semantic_chunks(document, paper) if parsed["text"] or document.get("text_blocks") else []
+    save_layout_artifacts(document)
+    (config.PARSED_DIR / paper_id / "chunks.json").write_text(json.dumps(chunks, ensure_ascii=False, indent=2), encoding="utf-8")
+    gateway.invoke(
+        "Knowledge RAG Agent",
+        "database",
+        "insert_chunks",
+        insert_chunks,
+        conn,
+        document,
+        chunks,
+        input_summary=f"paper_id={paper_id}; chunks={len(chunks)}",
+        output_summarizer=lambda value: f"pages={value['pages']}; sections={value['sections']}; chunks={value['chunks']}",
+    )
     vector_status = "done" if chunks else "skipped"
     index_result = gateway.invoke(
         "Knowledge RAG Agent",
@@ -466,11 +541,22 @@ def ingest_pdf(conn: Any, gateway: ToolGateway, task_id: str, file_bytes: bytes,
     return paper, fallbacks
 
 
-def generate_note(conn: Any, gateway: ToolGateway, task_id: str, paper: dict[str, Any], query: str) -> tuple[str, dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    evidence, _ = retrieve_evidence(gateway, conn, "paper_only", paper["id"], query or paper.get("title", ""))
+def generate_note(
+    conn: Any,
+    gateway: ToolGateway,
+    task_id: str,
+    paper: dict[str, Any],
+    query: str,
+    evidence: list[dict[str, Any]] | None = None,
+    retrieve_meta: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[str], dict[str, Any]]:
+    if evidence is None or retrieve_meta is None:
+        evidence, retrieve_meta = retrieve_evidence(gateway, conn, "paper_only", paper["id"], query or paper.get("title", ""))
+    evidence_bundle = build_evidence_bundle(evidence or [], retrieve_meta or {})
     rows = collect_scope_chunks(conn, "paper_only", paper["id"])
     if not evidence and rows:
         evidence = [{**row, "rank": idx + 1, "score": 0, "text": row.get("text", "")[: config.MAX_EVIDENCE_CHARS]} for idx, row in enumerate(rows[:5])]
+        evidence_bundle = build_evidence_bundle(evidence, retrieve_meta or {})
     full_text = "\n\n".join(row.get("text", "") for row in rows)
     skill_result = gateway.invoke(
         "Note Skill Agent",
@@ -478,9 +564,11 @@ def generate_note(conn: Any, gateway: ToolGateway, task_id: str, paper: dict[str
         "run_deep_paper_note_skill",
         run_deep_paper_note_skill,
         paper,
+        evidence_bundle,
         full_text,
         evidence,
         "zh",
+        {"note_mode": "long_paper" if len(full_text) > config.LONG_PAPER_CHAR_THRESHOLD or len(evidence) > config.LONG_PAPER_CHUNK_THRESHOLD else "normal", "template_version": "obsidian_note_v2", "max_repair_rounds": config.MAX_NOTE_REPAIR_ROUNDS},
         input_summary=f"paper_id={paper['id']}; evidence={len(evidence)}; text_chars={len(full_text)}",
         output_summarizer=lambda value: f"status={value['status']}; markdown_chars={len(value['note_markdown'])}; phases={len(value['skill_phases'])}",
     )
@@ -488,38 +576,53 @@ def generate_note(conn: Any, gateway: ToolGateway, task_id: str, paper: dict[str
     quality = skill_result["quality_check"]
     phases = skill_result["skill_phases"]
     fallbacks: list[Any] = list(skill_result.get("fallbacks", []))
-    client = get_deepseek_client()
-    if client is None:
-        phases.append({"name": "llm_note_generation", "status": "skipped", "summary": "DEEPSEEK_API_KEY is not set; used local note template."})
-        fallbacks.append("deepseek_api_key_missing_local_note_used")
+    model_gateway = get_model_gateway()
+    system, prompt = build_note_generation_prompt_text(paper, evidence, full_text)
+    prompt = f"{prompt}\n\nStructured evidence bundle:\n{format_grouped_evidence_for_prompt(evidence_bundle)}\n\nRules: abstract_chunks are high-level clues only. Prefer body method/experiment/result evidence for concrete claims. If body evidence is insufficient, say so."
+    image_paths, image_context = collect_note_image_context(conn, paper["id"], evidence)
+    if image_context:
+        prompt = f"{prompt}\n\n{image_context}\n\n请结合这些图片附件和文本 evidence 生成笔记；涉及图中信息时注明来自图像/图注/附近文本的证据。"
+        phases.append({"name": "multimodal_evidence", "status": "success", "summary": f"Attached {len(image_paths)} figure/page images for model note generation."})
     else:
-        llm_result = client.chat(
-            build_note_generation_prompt(paper, evidence, full_text),
-            model=config.DEEPSEEK_MODEL_NOTE,
-            temperature=0.2,
-            max_tokens=3600,
+        phases.append({"name": "multimodal_evidence", "status": "skipped", "summary": "No extracted figure/page images available for model note generation."})
+    llm_result = model_gateway.generate_text(
+        prompt,
+        system=system,
+        purpose="note",
+        temperature=0.2,
+        max_output_tokens=3600,
+        image_paths=image_paths,
+    )
+    if llm_result.ok:
+        llm_quality = check_required_note_sections(llm_result.content)
+        log_mcp(
+            conn,
+            task_id,
+            "llm",
+            "model_note_generation",
+            f"{llm_result.model}; images={len(image_paths)}",
+            llm_result.usage_summary or f"Model note generated; images={len(image_paths)}",
         )
-        if llm_result.ok:
-            llm_quality = check_required_note_sections(llm_result.content)
-            log_mcp(conn, task_id, "llm", "deepseek_note_generation", llm_result.model, llm_result.usage_summary or "DeepSeek note generated.")
-            if llm_quality["ok"]:
-                markdown = llm_result.content
-                quality = {
-                    **quality,
-                    **llm_quality,
-                    "llm_generated": True,
-                    "model": llm_result.model,
-                    "usage_summary": llm_result.usage_summary,
-                }
-                phases.append({"name": "llm_note_generation", "status": "ok", "summary": f"Generated note with {llm_result.model}."})
-            else:
-                fallbacks.append("deepseek_note_missing_required_sections_local_note_used")
-                quality = {**quality, "llm_generated": False, "llm_quality": llm_quality}
-                phases.append({"name": "repair_if_needed", "status": "fallback", "summary": "DeepSeek note missed required headings; kept local structured note."})
+        if llm_quality["ok"]:
+            markdown = llm_result.content
+            fallbacks = remove_local_note_generation_fallbacks(fallbacks)
+            quality = {
+                **quality,
+                **llm_quality,
+                "llm_generated": True,
+                "model": llm_result.model,
+                "usage_summary": llm_result.usage_summary,
+                "multimodal_image_count": len(image_paths),
+            }
+            phases.append({"name": "llm_note_generation", "status": "ok", "summary": f"Generated note with {llm_result.model}."})
         else:
-            fallbacks.append("deepseek_note_generation_failed_local_note_used")
-            log_mcp(conn, task_id, "llm", "deepseek_note_generation", llm_result.model, "DeepSeek note generation failed.", status="error", error=llm_result.error)
-            phases.append({"name": "llm_note_generation", "status": "fallback", "summary": "DeepSeek call failed; used local note template."})
+            fallbacks.append("model_note_missing_required_sections_local_note_used")
+            quality = {**quality, "llm_generated": False, "llm_quality": llm_quality}
+            phases.append({"name": "repair_if_needed", "status": "fallback", "summary": "Model note missed required headings; kept local structured note."})
+    else:
+        fallbacks.append("model_note_generation_failed_local_note_used")
+        log_mcp(conn, task_id, "llm", "model_note_generation", f"{llm_result.model}; images={len(image_paths)}", "Model note generation failed.", status="error", error=llm_result.error)
+        phases.append({"name": "llm_note_generation", "status": "fallback", "summary": "Model call failed; used local note template."})
     folder = None
     if paper.get("folder_id") and paper["folder_id"] != "folder_all":
         folder = conn.execute("SELECT name FROM folders WHERE id = ?", (paper["folder_id"],)).fetchone()
@@ -528,9 +631,9 @@ def generate_note(conn: Any, gateway: ToolGateway, task_id: str, paper: dict[str
         "Note Skill Agent",
         "file",
         "write_markdown_note",
-        note_path.write_text,
+        write_markdown_note,
+        note_path,
         markdown,
-        encoding="utf-8",
         input_summary=paper.get("title", ""),
         output_summarizer=lambda value: str(note_path),
     )
@@ -539,7 +642,7 @@ def generate_note(conn: Any, gateway: ToolGateway, task_id: str, paper: dict[str
         "Note Skill Agent",
         "file",
         "copy_pdf_to_obsidian",
-        lambda source, target: target.write_bytes(source.read_bytes()),
+        copy_pdf_to_obsidian,
         Path(paper["file_path"]),
         attachment_path,
         input_summary=f"paper_id={paper['id']}",
@@ -547,17 +650,44 @@ def generate_note(conn: Any, gateway: ToolGateway, task_id: str, paper: dict[str
     )
 
     note_id = new_id("note")
-    conn.execute(
-        "INSERT INTO reading_notes (id, paper_id, content_markdown, obsidian_path, quality_check_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (note_id, paper["id"], markdown, str(note_path), quality_json(quality), now_iso(), now_iso()),
+    gateway.invoke(
+        "Note Skill Agent",
+        "database",
+        "insert_note",
+        insert_note,
+        conn,
+        {
+            "id": note_id,
+            "paper_id": paper["id"],
+            "content_markdown": markdown,
+            "obsidian_path": str(note_path),
+            "quality_check_json": quality_json(quality),
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        },
+        input_summary=f"paper_id={paper['id']}; note_id={note_id}",
+        output_summarizer=lambda value: value["id"],
     )
     note_chunks = note_to_chunks(note_id, paper["id"], markdown)
-    for chunk in note_chunks:
-        conn.execute(
-            "INSERT INTO note_chunks (id, note_id, paper_id, section_name, chunk_index, text, vector_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (chunk["id"], note_id, paper["id"], chunk["section_name"], chunk["chunk_index"], chunk["text"], chunk["id"], chunk["created_at"]),
-        )
     gateway.invoke(
+        "Note Skill Agent",
+        "database",
+        "insert_note_chunks",
+        insert_note_chunks,
+        conn,
+        note_chunks,
+        input_summary=f"note_id={note_id}; chunks={len(note_chunks)}",
+        output_summarizer=lambda value: f"chunks={value}",
+    )
+    for chunk in note_chunks:
+        chunk.update(
+            {
+                "source_type": "note",
+                "note_id": note_id,
+                "paper_id": paper["id"],
+            }
+        )
+    note_index_result = gateway.invoke(
         "Note Skill Agent",
         "rag",
         "build_note_vector_index",
@@ -569,12 +699,123 @@ def generate_note(conn: Any, gateway: ToolGateway, task_id: str, paper: dict[str
         input_summary=f"note_id={note_id}; chunks={len(note_chunks)}",
         output_summarizer=lambda value: f"backend={value['backend']}; indexed={value['indexed']}; status={value['status']}",
     )
-    log_mcp(conn, task_id, "database", "insert_note", note_id, f"paper_id={paper['id']}; chunks={len(note_chunks)}")
-    conn.execute("UPDATE papers SET note_status = ?, obsidian_note_path = ?, updated_at = ? WHERE id = ?", ("done", str(note_path), now_iso(), paper["id"]))
-    paper["note_status"] = "done"
+    note_status = "done" if skill_result.get("status") == "success" else "partial"
+    gateway.invoke(
+        "Note Skill Agent",
+        "database",
+        "update_paper_status",
+        update_paper_status,
+        conn,
+        paper["id"],
+        note_status,
+        str(note_path),
+        input_summary=f"paper_id={paper['id']}; note_status={note_status}",
+        output_summarizer=lambda value: note_status,
+    )
+    paper["note_status"] = note_status
     paper["obsidian_note_path"] = str(note_path)
     paper["obsidian_pdf_path"] = str(attachment_path)
-    return markdown, quality, phases, evidence, fallbacks
+    phases.extend(
+        [
+            {"name": "write_obsidian_note", "status": "success", "summary": str(note_path)},
+            {"name": "copy_pdf_to_obsidian", "status": "success", "summary": str(attachment_path)},
+            {"name": "insert_note", "status": "success", "summary": note_id},
+            {"name": "insert_note_chunks", "status": "success", "summary": f"chunks={len(note_chunks)}"},
+            {"name": "build_note_vector_index", "status": "success" if note_index_result.get("status") in {"done", "fallback_index_recorded"} else "partial", "summary": f"backend={note_index_result.get('backend')}; status={note_index_result.get('status')}"},
+        ]
+    )
+    note_generation = {
+        "mode": quality.get("note_generation_mode") or ("long_paper" if quality.get("long_paper") else "normal"),
+        "template_version": quality.get("template_version") or "obsidian_note_v2",
+        "quality_check": quality,
+        "repair_rounds": quality.get("repair_rounds", 0),
+        "repair_log": quality.get("repair_log", []),
+        "note_id": note_id,
+        "note_chunks": len(note_chunks),
+        "note_vector_status": note_index_result.get("status", "unknown"),
+        "vector_backend": note_index_result.get("backend", ""),
+        "markdown_path": str(note_path),
+        "pdf_attachment_path": str(attachment_path),
+        "evidence_group_counts": quality.get("evidence_group_counts", {}),
+    }
+    return markdown, quality, phases, evidence, fallbacks, note_generation
+
+
+def format_grouped_evidence_for_prompt(evidence_bundle: dict[str, Any]) -> str:
+    labels = [
+        ("section_summaries", "Section Summaries"),
+        ("text_chunks", "Text Chunks"),
+        ("abstract_chunks", "Abstract Clues"),
+        ("tables", "Tables"),
+        ("figures", "Figures"),
+        ("pages", "Pages"),
+    ]
+    parts: list[str] = []
+    for key, label in labels:
+        items = evidence_bundle.get(key) or []
+        if not items:
+            continue
+        lines = []
+        for item in items[:6]:
+            location = item.get("section_path") or item.get("section_name") or key
+            text = (item.get("text") or "")[: config.MAX_EVIDENCE_CHARS]
+            lines.append(f"- [{location}] {text}")
+        parts.append(f"[{label}]\n" + "\n".join(lines))
+    return "\n\n".join(parts) or "No grouped evidence available."
+
+
+def synthesize_answer_from_bundle_with_optional_llm(
+    gateway: ToolGateway,
+    task_id: str,
+    question: str,
+    evidence: list[dict[str, Any]],
+    evidence_bundle: dict[str, Any],
+    retrieval: dict[str, Any],
+    chat_scope: str,
+    fallbacks: list[str],
+) -> str:
+    if not evidence:
+        fallbacks.append("no_matching_evidence")
+        return "没有检索到足够的 evidence。当前回答可靠性较低，建议重新上传更完整的 PDF 或换一个更具体的问题。"
+    model_gateway = get_model_gateway()
+    grouped = format_grouped_evidence_for_prompt(evidence_bundle)
+    query_analysis = retrieval.get("query_analysis") or {}
+    coverage = retrieval.get("coverage_check") or {}
+    system = (
+        "You are the Note Skill Agent in Local Research Agent. Answer in Chinese. "
+        "Use only the grouped local evidence. If evidence is insufficient, say so clearly. "
+        "Abstract evidence is only a high-level clue unless the user explicitly asks for abstract or whole-paper summary."
+    )
+    prompt = f"""[Question]
+{question}
+
+[Chat Scope]
+{chat_scope}
+
+[Query Analysis]
+complexity: {query_analysis.get('complexity', '')}
+intent: {query_analysis.get('intent', '')}
+abstract_mode: {query_analysis.get('abstract_mode', '')}
+
+{grouped}
+
+[Coverage]
+{json.dumps(coverage, ensure_ascii=False)}
+
+[Rules]
+1. Do not use abstract evidence as a substitute for method, experiment, result, or limitation body evidence.
+2. For complex questions, separate directly supported conclusions from reasonable evidence-based inference.
+3. If coverage is insufficient, state which part lacks evidence.
+4. Keep the answer concise, structured, and grounded.
+"""
+    result = model_gateway.generate_text(prompt, system=system, purpose="chat", temperature=0.2, max_output_tokens=1600)
+    if result.ok:
+        log_mcp(gateway.conn, task_id, "llm", "model_chat", result.model, result.usage_summary or "Grouped evidence answer generated.")
+        return result.content
+    fallbacks.append("model_chat_failed_local_rag_answer_used")
+    log_mcp(gateway.conn, task_id, "llm", "model_chat", result.model, "Model call failed.", status="error", error=result.error)
+    bullets = "\n".join(f"- {item.get('section_name', '')}: {(item.get('text') or '')[:220]}" for item in evidence[:3])
+    return f"模型调用失败，已使用本地 grouped evidence 兜底回答：\n{bullets}"
 
 
 def run_upload_graph(conn: Any, task_id: str, task_type: str, file_bytes: bytes, file_name: str, folder_id: str, message: str) -> AgentState:
@@ -588,11 +829,14 @@ def run_upload_graph(conn: Any, task_id: str, task_type: str, file_bytes: bytes,
     trace("coordinator_node", "Harness", "route_task", f"task_type={task_type}; phase={initial_phase(task_type)}")
     state: AgentState = {
         "task_id": task_id,
+        "run_id": new_id("run"),
         "user_input": message,
         "task_type": task_type,
         "phase": "START",
         "current_folder_id": folder_id,
         "chat_scope": "paper_and_note",
+        "context_pack_strategy": context_pack_strategy(task_type, "paper_and_note"),
+        "harness": {"runtime_status": "running"},
         "uploaded_file_bytes": file_bytes,
         "original_file_name": file_name,
         "fallbacks": [],
@@ -631,21 +875,35 @@ def run_upload_graph(conn: Any, task_id: str, task_type: str, file_bytes: bytes,
         inner["retrieved_chunks"] = evidence
         inner["rag_evidence"] = evidence
         inner["retrieve_meta"] = retrieve_meta
+        inner["retrieval"] = retrieve_meta
+        inner["evidence_bundle"] = build_evidence_bundle(evidence, retrieve_meta)
         inner["evidence_ready"] = True
         inner["needs_evidence"] = False
         inner["phase"] = "EVIDENCE_READY"
         if not evidence:
             inner.setdefault("fallbacks", []).append("no_relevant_evidence_for_note")
-        log_a2a(conn, task_id, "Knowledge RAG Agent", "Note Skill Agent", "evidence_ready", {"count": len(evidence), "scope": "paper_only"})
+        log_a2a(conn, task_id, "Knowledge RAG Agent", "Note Skill Agent", "evidence_bundle_ready", {"count": len(evidence), "scope": "paper_only", "evidence_bundle": inner["evidence_bundle"]})
         return inner
 
     def note_handler(inner: AgentState) -> AgentState:
         trace("note_skill_agent_node", "Note Skill Agent", "generate_note", "phase=EVIDENCE_READY")
         paper = inner.get("paper") or {}
-        _, quality, phases, evidence, note_fallbacks = generate_note(conn, gateway, task_id, paper, message)
-        paper["note_status"] = "done"
+        _, quality, phases, evidence, note_fallbacks, note_generation = generate_note(
+            conn,
+            gateway,
+            task_id,
+            paper,
+            message,
+            inner.get("rag_evidence", []),
+            inner.get("retrieve_meta") or inner.get("retrieval") or {},
+        )
         inner["paper"] = paper
         inner["note_quality_check"] = quality
+        inner["note_generation"] = note_generation
+        inner["note_id"] = note_generation.get("note_id")
+        inner["note_vector_status"] = note_generation.get("note_vector_status", "")
+        inner["obsidian_note_path"] = note_generation.get("markdown_path", "")
+        inner["obsidian_pdf_path"] = note_generation.get("pdf_attachment_path", "")
         inner["skill_phases"] = phases
         inner["rag_evidence"] = evidence
         inner.setdefault("fallbacks", []).extend(note_fallbacks)
@@ -689,12 +947,15 @@ def run_chat_graph(conn: Any, task_id: str, payload: ChatMessage, paper: dict[st
     trace("coordinator_node", "Harness", "route_task", f"task_type={task_type}; phase={initial_phase(task_type)}")
     state: AgentState = {
         "task_id": task_id,
+        "run_id": new_id("run"),
         "user_input": payload.message,
         "task_type": task_type,
         "phase": "START",
         "current_paper_id": payload.current_paper_id,
         "current_folder_id": payload.current_folder_id,
         "chat_scope": payload.chat_scope,
+        "context_pack_strategy": context_pack_strategy(task_type, payload.chat_scope),
+        "harness": {"runtime_status": "running"},
         "paper": paper or {},
         "fallbacks": [],
         "skill_phases": [],
@@ -714,6 +975,8 @@ def run_chat_graph(conn: Any, task_id: str, payload: ChatMessage, paper: dict[st
         inner["retrieved_chunks"] = evidence
         inner["rag_evidence"] = evidence
         inner["retrieve_meta"] = retrieve_meta
+        inner["retrieval"] = retrieve_meta
+        inner["evidence_bundle"] = build_evidence_bundle(evidence, retrieve_meta)
         inner["evidence_ready"] = True
         inner["needs_evidence"] = False
         inner["phase"] = "EVIDENCE_READY"
@@ -721,7 +984,7 @@ def run_chat_graph(conn: Any, task_id: str, payload: ChatMessage, paper: dict[st
             inner.setdefault("fallbacks", []).append("vector_retrieve_failed_local_keyword_used")
         if not evidence:
             inner.setdefault("fallbacks", []).append("no_matching_evidence")
-        log_a2a(conn, task_id, "Knowledge RAG Agent", "Note Skill Agent", "evidence_ready", {"count": len(evidence), "scope": payload.chat_scope})
+        log_a2a(conn, task_id, "Knowledge RAG Agent", "Note Skill Agent", "evidence_bundle_ready", {"count": len(evidence), "scope": payload.chat_scope, "evidence_bundle": inner["evidence_bundle"]})
         return inner
 
     def note_handler(inner: AgentState) -> AgentState:
@@ -730,8 +993,21 @@ def run_chat_graph(conn: Any, task_id: str, payload: ChatMessage, paper: dict[st
             inner["error"] = "Generating a note requires a current paper."
             return inner
         trace("note_skill_agent_node", "Note Skill Agent", "generate_note", "phase=EVIDENCE_READY")
-        _, quality, phases, evidence, note_fallbacks = generate_note(conn, gateway, task_id, paper, payload.message)
+        _, quality, phases, evidence, note_fallbacks, note_generation = generate_note(
+            conn,
+            gateway,
+            task_id,
+            paper,
+            payload.message,
+            inner.get("rag_evidence", []),
+            inner.get("retrieve_meta") or inner.get("retrieval") or {},
+        )
         inner["note_quality_check"] = quality
+        inner["note_generation"] = note_generation
+        inner["note_id"] = note_generation.get("note_id")
+        inner["note_vector_status"] = note_generation.get("note_vector_status", "")
+        inner["obsidian_note_path"] = note_generation.get("markdown_path", "")
+        inner["obsidian_pdf_path"] = note_generation.get("pdf_attachment_path", "")
         inner["skill_phases"] = phases
         inner["rag_evidence"] = evidence
         inner.setdefault("fallbacks", []).extend(note_fallbacks)
@@ -748,7 +1024,16 @@ def run_chat_graph(conn: Any, task_id: str, payload: ChatMessage, paper: dict[st
     def answer_handler(inner: AgentState) -> AgentState:
         trace("note_skill_agent_node", "Note Skill Agent", "answer_chat", "phase=EVIDENCE_READY")
         fallbacks = inner.setdefault("fallbacks", [])
-        answer = synthesize_answer_with_optional_llm(gateway, task_id, payload.message, inner.get("rag_evidence", []), fallbacks)
+        answer = synthesize_answer_from_bundle_with_optional_llm(
+            gateway,
+            task_id,
+            payload.message,
+            inner.get("rag_evidence", []),
+            inner.get("evidence_bundle") or build_evidence_bundle(inner.get("rag_evidence", []), inner.get("retrieval") or {}),
+            inner.get("retrieval") or {},
+            payload.chat_scope,
+            fallbacks,
+        )
         inner["answer"] = answer
         inner["message_type"] = "assistant_answer"
         inner["phase"] = "ANSWER_READY"
@@ -764,7 +1049,7 @@ def run_chat_graph(conn: Any, task_id: str, payload: ChatMessage, paper: dict[st
 
 
 @app.post("/api/chat/upload")
-async def upload_pdf(file: UploadFile = File(...), current_folder_id: str = Form("folder_all"), message: str = Form("")) -> dict[str, Any]:
+async def upload_pdf(file: UploadFile = File(...), current_folder_id: str = Form("folder_all"), session_id: str = Form("session_default"), message: str = Form("")) -> dict[str, Any]:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in config.ALLOWED_UPLOAD_EXTENSIONS:
         raise api_error(400, "invalid_file_type", "Only PDF files are allowed.")
@@ -775,70 +1060,32 @@ async def upload_pdf(file: UploadFile = File(...), current_folder_id: str = Form
     if not content.startswith(b"%PDF"):
         raise api_error(400, "invalid_pdf", "Uploaded file does not look like a PDF.")
 
-    task_id = new_id("task")
-    task_type = task_type_from_message(message, has_upload=True)
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO agent_tasks (id, task_type, user_input, status, current_folder_id, chat_scope, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (task_id, task_type, message, "running", current_folder_id, "paper_and_note", now_iso(), now_iso()),
-        )
-        final_state = run_upload_graph(conn, task_id, task_type, content, file.filename or "paper.pdf", current_folder_id, message)
-        paper = final_state.get("paper", {})
-        answer = final_state.get("answer") or "任务执行中止：检测到异常循环。"
-        message_type = final_state.get("message_type") or "assistant_answer"
-        evidence = final_state.get("rag_evidence", [])
-        skill_phases = final_state.get("skill_phases", [])
-        fallbacks = final_state.get("fallbacks", [])
-        conn.execute("UPDATE agent_tasks SET status = ?, current_paper_id = ?, answer = ?, updated_at = ? WHERE id = ?", ("done", paper["id"], answer, now_iso(), task_id))
-        execution = execution_from(conn, task_id, evidence, skill_phases, fallbacks)
-    return {
-        "task_id": task_id,
-        "answer": answer,
-        "message_type": message_type,
-        "current_paper": {"paper_id": paper["id"], "title": paper["title"]},
-        "artifacts": {
-            "markdown_path": paper.get("obsidian_note_path", ""),
-            "pdf_path": paper["file_path"],
-            "obsidian_pdf_path": paper.get("obsidian_pdf_path", ""),
-        },
-        "execution": execution,
-    }
+    return run_upload_task(
+        file_bytes=content,
+        file_name=file.filename or "paper.pdf",
+        folder_id=current_folder_id,
+        session_id=session_id,
+        message=message,
+        task_type_resolver=task_type_from_message,
+        ensure_session_fn=ensure_session,
+        touch_session_fn=touch_session,
+        upload_graph_runner=run_upload_graph,
+    )
+
 
 
 @app.post("/api/chat/message")
 def chat_message(payload: ChatMessage) -> dict[str, Any]:
     if payload.chat_scope not in {"paper_and_note", "paper_only", "note_only", "global_library"}:
         raise api_error(400, "invalid_chat_scope", "Unsupported chat scope.")
-    task_id = new_id("task")
-    task_type = task_type_from_message(payload.message)
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO agent_tasks (id, task_type, user_input, status, current_paper_id, current_folder_id, chat_scope, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (task_id, task_type, payload.message, "running", payload.current_paper_id, payload.current_folder_id, payload.chat_scope, now_iso(), now_iso()),
+    try:
+        return run_chat_task(
+            payload=payload,
+            task_type_resolver=task_type_from_message,
+            ensure_session_fn=ensure_session,
+            touch_session_fn=touch_session,
+            chat_graph_runner=run_chat_graph,
         )
-        paper = None
-        if payload.current_paper_id:
-            paper = row_to_dict(conn.execute("SELECT * FROM papers WHERE id = ?", (payload.current_paper_id,)).fetchone())
-        if task_type == "generate_note" and not paper:
-            raise api_error(400, "current_paper_required", "Generating a note requires a current paper.")
-        final_state = run_chat_graph(conn, task_id, payload, paper)
-        evidence = final_state.get("rag_evidence", [])
-        skill_phases = final_state.get("skill_phases", [])
-        fallbacks = final_state.get("fallbacks", [])
-        answer = final_state.get("answer") or "任务执行中止：检测到异常循环。"
-        message_type = final_state.get("message_type") or "assistant_answer"
+    except RuntimeTaskError as exc:
+        raise api_error(exc.status, exc.code, exc.message) from exc
 
-        conn.execute("UPDATE agent_tasks SET status = ?, answer = ?, updated_at = ? WHERE id = ?", ("done", answer, now_iso(), task_id))
-        execution = execution_from(conn, task_id, evidence, skill_phases, fallbacks)
-    return {
-        "task_id": task_id,
-        "answer": answer,
-        "message_type": message_type,
-        "current_paper": {"paper_id": paper["id"], "title": paper["title"]} if paper else None,
-        "artifacts": {
-            "markdown_path": paper.get("obsidian_note_path", "") if paper else "",
-            "pdf_path": paper.get("file_path", "") if paper else "",
-            "obsidian_pdf_path": paper.get("obsidian_pdf_path", "") if paper else "",
-        },
-        "execution": execution,
-    }
