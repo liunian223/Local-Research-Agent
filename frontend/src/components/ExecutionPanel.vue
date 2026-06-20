@@ -21,29 +21,31 @@
         <div><span>redaction</span><strong>{{ harness.redaction?.enabled ? "enabled" : "disabled" }}</strong></div>
       </div>
 
-      <div class="section-title">RAG 检索策略</div>
+      <div class="section-title">RAG retrieval strategy</div>
       <div class="rag-summary">
-        <div><span>问题复杂度</span><strong>{{ textValue(queryAnalysis.complexity) }}</strong></div>
-        <div><span>问题意图</span><strong>{{ textValue(queryAnalysis.intent) }}</strong></div>
-        <div><span>检索模式</span><strong>{{ retrieval.retrieval_mode || "-" }}</strong></div>
-        <div><span>摘要策略</span><strong>{{ textValue(queryAnalysis.abstract_mode || abstractControl.abstract_mode) }}</strong></div>
-        <div><span>候选数量</span><strong>{{ numberValue(rerank.candidate_count) }}</strong></div>
-        <div><span>最终证据</span><strong>{{ numberValue(rerank.final_count, evidenceCount) }}</strong></div>
+        <div><span>query complexity</span><strong>{{ textValue(queryAnalysis.complexity) }}</strong></div>
+        <div><span>query intent</span><strong>{{ textValue(queryAnalysis.intent) }}</strong></div>
+        <div><span>retrieval mode</span><strong>{{ retrieval.retrieval_mode || "-" }}</strong></div>
+        <div><span>actual backend</span><strong>{{ textValue(backendDiagnostics.actual_backend || retrieval.backend) }}</strong></div>
+        <div><span>fallback reason</span><strong>{{ textValue(backendDiagnostics.fallback_reason || retrieval.fallback_reason) }}</strong></div>
+        <div><span>abstract strategy</span><strong>{{ textValue(queryAnalysis.abstract_mode || abstractControl.abstract_mode) }}</strong></div>
+        <div><span>candidate count</span><strong>{{ numberValue(rerank.candidate_count) }}</strong></div>
+        <div><span>final evidence</span><strong>{{ numberValue(rerank.final_count, evidenceCount) }}</strong></div>
       </div>
 
       <div v-if="hasAbstractControl" class="section-title">摘要控制</div>
       <div v-if="hasAbstractControl" class="rag-summary">
-        <div><span>检测到摘要</span><strong>{{ boolText(abstractControl.has_abstract) }}</strong></div>
-        <div><span>召回摘要片段</span><strong>{{ numberValue(abstractControl.abstract_chunks_recalled, 0) }}</strong></div>
-        <div><span>最终使用摘要</span><strong>{{ numberValue(abstractControl.abstract_chunks_used, 0) }}</strong></div>
-        <div><span>是否降权</span><strong>{{ boolText(abstractControl.abstract_penalty_applied) }}</strong></div>
+        <div><span>has abstract</span><strong>{{ boolText(abstractControl.has_abstract) }}</strong></div>
+        <div><span>abstract chunks recalled</span><strong>{{ numberValue(abstractControl.abstract_chunks_recalled, 0) }}</strong></div>
+        <div><span>abstract chunks used</span><strong>{{ numberValue(abstractControl.abstract_chunks_used, 0) }}</strong></div>
+        <div><span>downweighted</span><strong>{{ boolText(abstractControl.abstract_penalty_applied) }}</strong></div>
       </div>
 
       <div v-if="hasCoverage" class="section-title">Evidence coverage</div>
       <div v-if="hasCoverage" class="coverage-list">
         <div v-for="section in coverageRows" :key="section.name">
           <span>{{ section.name }}</span>
-          <strong>{{ section.covered ? "已覆盖" : "证据不足" }}</strong>
+          <strong>{{ section.covered ? "covered" : "missing evidence" }}</strong>
         </div>
       </div>
 
@@ -65,10 +67,26 @@
         <div><span>Vector backend</span><strong>{{ noteGeneration.vector_backend || "-" }}</strong></div>
       </div>
 
-      <div v-if="hasNoteGeneration" class="section-title">Note 质量检查</div>
+      <div v-if="hasNoteGeneration" class="section-title">Note quality check</div>
       <pre v-if="hasNoteGeneration">{{ stringify(noteGeneration.quality_check) }}</pre>
       <div v-if="hasNoteGeneration" class="section-title">Note 写入 / Repair</div>
       <pre v-if="hasNoteGeneration">{{ stringify(noteWriteSummary) }}</pre>
+
+      <div v-if="hasPdfImageExtraction" class="section-title">PDF Image Extraction</div>
+      <div v-if="hasPdfImageExtraction" class="rag-summary">
+        <div><span>status</span><strong>{{ textValue(pdfImageExtraction.status) }}</strong></div>
+        <div><span>extracted</span><strong>{{ numberValue(pdfImageExtraction.extracted_count, 0) }}</strong></div>
+        <div><span>skipped small</span><strong>{{ numberValue(pdfImageExtraction.skipped_small, 0) }}</strong></div>
+      </div>
+
+      <div v-if="hasVisionExecution" class="section-title">Codex Vision</div>
+      <div v-if="hasVisionExecution" class="rag-summary">
+        <div><span>status</span><strong>{{ textValue(visionExecution.status) }}</strong></div>
+        <div><span>codex status</span><strong>{{ textValue(visionExecution.codex_vision_status) }}</strong></div>
+        <div><span>selected images</span><strong>{{ selectedImageCount }}</strong></div>
+        <div><span>render status</span><strong>{{ textValue(visionExecution.render_status) }}</strong></div>
+      </div>
+      <pre v-if="hasVisionExecution">{{ stringify(visionExecution) }}</pre>
 
       <div class="section-title">Graph state</div>
       <pre>{{ stringify(execution.graph_state) }}</pre>
@@ -117,12 +135,18 @@ const queryAnalysis = computed<JsonObject>(() => retrieval.value.query_analysis 
 const abstractControl = computed<JsonObject>(() => retrieval.value.abstract_control || {});
 const rerank = computed<JsonObject>(() => retrieval.value.rerank || {});
 const coverage = computed<JsonObject>(() => retrieval.value.coverage_check || {});
+const backendDiagnostics = computed<JsonObject>(() => retrieval.value.backend_diagnostics || retrieval.value.backend_status || {});
 const bundle = computed<EvidenceBundle>(() => execution.value.evidence_bundle || {});
 const noteGeneration = computed<NoteGenerationSummary>(() => execution.value.note_generation || {});
+const visionExecution = computed<JsonObject>(() => objectValue(execution.value.vision_execution));
+const pdfImageExtraction = computed<JsonObject>(() => objectValue(execution.value.pdf_image_extraction));
 const evidenceCount = computed(() => execution.value.rag_evidence?.length || 0);
 const hasAbstractControl = computed(() => Object.keys(abstractControl.value).length > 0);
 const hasCoverage = computed(() => Object.keys(coverage.value).length > 0);
 const hasNoteGeneration = computed(() => Object.keys(noteGeneration.value).length > 0);
+const hasVisionExecution = computed(() => Object.keys(visionExecution.value).length > 0);
+const hasPdfImageExtraction = computed(() => Object.keys(pdfImageExtraction.value).length > 0);
+const selectedImageCount = computed(() => arrayValue(visionExecution.value.selected_image_paths).length);
 const coverageRows = computed(() => {
   const covered = objectValue(coverage.value.covered_sections) as Record<string, JsonValue>;
   const missing = arrayValue(coverage.value.missing_sections).map(String);
@@ -164,7 +188,7 @@ function numberValue(value: unknown, fallback: number | string = "-"): number | 
 
 function boolText(value: unknown): string {
   if (value === undefined || value === null) return "-";
-  return value ? "是" : "否";
+  return value ? "yes" : "no";
 }
 
 function stringify(value: unknown) {

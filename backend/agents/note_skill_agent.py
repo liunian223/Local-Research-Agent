@@ -18,7 +18,7 @@ def note_skill_agent_node(
     phase = state.get("phase")
     if phase == "EVIDENCE_READY" and task_type in {"generate_note", "import_and_note"}:
         return generate_note_handler(state)
-    if phase == "EVIDENCE_READY" and task_type in {"paper_chat", "global_chat"}:
+    if phase == "EVIDENCE_READY" and task_type in {"paper_chat", "global_chat", "vision_chat"}:
         return answer_chat_handler(state)
     if phase == "REQUEST_EVIDENCE":
         state["needs_evidence"] = True

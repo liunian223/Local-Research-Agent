@@ -212,6 +212,33 @@ def insert_chunks(conn: Any, document: dict[str, Any], chunks: list[dict[str, An
     }
 
 
+def insert_image_assets(conn: Any, assets: list[dict[str, Any]]) -> dict[str, Any]:
+    now = now_iso()
+    inserted = 0
+    for asset in assets:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO image_assets
+            (id, paper_id, page_no, image_index, image_path, source_type, width, height, caption, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                asset.get("image_id") or asset.get("id") or new_id("img"),
+                asset["paper_id"],
+                asset.get("page_no"),
+                asset.get("image_index"),
+                asset["image_path"],
+                asset["source_type"],
+                asset.get("width"),
+                asset.get("height"),
+                asset.get("caption", ""),
+                asset.get("created_at") or now,
+            ),
+        )
+        inserted += 1
+    return {"inserted": inserted}
+
+
 def delete_paper_artifacts(
     conn: Any,
     paper_ids: list[str],
@@ -225,6 +252,7 @@ def delete_paper_artifacts(
     placeholders = ",".join("?" for _ in paper_ids)
     tables = [
         "chunk_links",
+        "image_assets",
         "document_chunks",
         "document_figures",
         "document_tables",

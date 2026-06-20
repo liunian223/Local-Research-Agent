@@ -10,6 +10,7 @@ pdfplumber
 pypdf
 chromadb
 sentence-transformers
+numpy
 python-dotenv
 pillow
 pytest

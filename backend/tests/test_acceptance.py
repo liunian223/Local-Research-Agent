@@ -28,6 +28,7 @@ import fitz
 from fastapi.testclient import TestClient
 from langgraph.graph import StateGraph
 
+import config
 from app import app, collect_note_image_context
 from database import connect, now_iso
 from graph.builder import build_langgraph_app
@@ -141,7 +142,9 @@ def test_import_note_artifacts_execution_and_paper_and_note_scope(tmp_path: Path
         upload = post_pdf(client, pdf, message="note")
         body = upload.json()
         assert upload.status_code == 200
-        assert body["message_type"] == "note_generated"
+        assert body["message_type"] == "partial_success"
+        assert body["execution"]["harness"]["runtime_status"] == "partial"
+        assert "llm_note_generation_failed_local_note_used" in body["execution"]["fallbacks"]
 
         artifacts = body["artifacts"]
         assert Path(artifacts["markdown_path"]).exists()
@@ -307,7 +310,7 @@ def test_layout_aware_rag_outputs_structured_artifacts_and_metadata(tmp_path: Pa
         assert upload.status_code == 200
         paper_id = upload.json()["current_paper"]["paper_id"]
 
-        parsed_root = TEST_ROOT / "data" / "parsed" / paper_id
+        parsed_root = config.PARSED_DIR / paper_id
         assert (parsed_root / "layout.json").exists()
         assert (parsed_root / "pages.json").exists()
         assert (parsed_root / "sections.json").exists()

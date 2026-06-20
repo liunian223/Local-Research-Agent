@@ -5,7 +5,9 @@ from typing import Any, Optional
 
 import config
 from deepseek_client import DeepSeekClient, LLMResult
-from llm.codex_cli_client import CodexCliClient
+from llm.base import LLMClientError
+from llm.codex_runtime_client import CodexRuntimeClient
+from llm.llm_router import get_llm_client
 from llm.openai_client import OpenAIClient
 
 
@@ -13,7 +15,7 @@ class ModelGateway:
     def __init__(self) -> None:
         self._openai_client: OpenAIClient | None = None
         self._deepseek_client: DeepSeekClient | None = None
-        self._codex_cli_client: CodexCliClient | None = None
+        self._codex_runtime_client: CodexRuntimeClient | None = None
 
     def generate_text(
         self,
@@ -25,7 +27,23 @@ class ModelGateway:
         image_paths: Optional[list[str]] = None,
     ) -> LLMResult:
         provider = config.TEXT_MODEL_PROVIDER.lower()
+        if provider in {"codex", "codex_cli", "codex_runtime"}:
+            try:
+                client = get_llm_client()
+                if isinstance(client, CodexRuntimeClient):
+                    if image_paths:
+                        content = client.vision_chat_sync(prompt if not system else f"{system}\n\n{prompt}", image_paths, task_type=purpose)
+                        return LLMResult(ok=True, content=content, model=self._model_for_purpose("vision"), usage_summary=f"provider=codex; images={len(image_paths)}")
+                    content = client.chat_sync(_chat_messages(prompt, system), task_type=purpose, temperature=temperature)
+                    return LLMResult(ok=True, content=content, model=self._model_for_purpose(purpose), usage_summary="provider=codex; images=0")
+                return LLMResult(ok=False, content="", model="codex", error="Configured Codex client does not expose sync chat.")
+            except LLMClientError as exc:
+                return LLMResult(ok=False, content="", model=self._model_for_purpose(purpose), error=str(exc))
+            except Exception as exc:
+                return LLMResult(ok=False, content="", model=self._model_for_purpose(purpose), error=str(exc)[:500])
         if provider == "openai":
+            if config.DISABLE_OPENAI_API:
+                return LLMResult(ok=False, content="", model=self._model_for_purpose(purpose), error="OpenAI API is disabled by configuration.")
             if not config.OPENAI_API_KEY:
                 return LLMResult(ok=False, content="", model=self._model_for_purpose(purpose), error="OPENAI_API_KEY is not set.")
             return self._openai().generate_text(
@@ -44,15 +62,14 @@ class ModelGateway:
                 temperature=temperature,
                 max_tokens=max_output_tokens,
             )
-        if provider == "codex_cli":
-            return self._codex_cli().generate_text(
-                prompt=prompt,
-                system=system,
-                model=config.CODEX_CLI_MODEL,
-                temperature=temperature,
-                max_output_tokens=max_output_tokens,
-                image_paths=image_paths,
-            )
+        if image_paths:
+            try:
+                client = get_llm_client()
+                if isinstance(client, CodexRuntimeClient):
+                    content = client.vision_chat_sync(prompt if not system else f"{system}\n\n{prompt}", image_paths, task_type=purpose)
+                    return LLMResult(ok=True, content=content, model=self._model_for_purpose("vision"), usage_summary=f"provider=codex; images={len(image_paths)}")
+            except Exception as exc:
+                return LLMResult(ok=False, content="", model=self._model_for_purpose("vision"), error=str(exc)[:500])
         return LLMResult(ok=False, content="", model="local_fallback", error=f"Local fallback provider selected: {provider}")
 
     def generate_json(
@@ -63,7 +80,25 @@ class ModelGateway:
         max_output_tokens: int = 2048,
     ) -> dict[str, Any]:
         provider = config.TEXT_MODEL_PROVIDER.lower()
+        if provider in {"codex", "codex_cli", "codex_runtime"}:
+            try:
+                client = get_llm_client()
+                if not isinstance(client, CodexRuntimeClient):
+                    return {"_error": "Configured Codex client does not expose sync chat.", "_model": "codex"}
+                result = client.chat_sync(_chat_messages(f"{prompt}\n\nReturn only strict JSON.", system), task_type="json", temperature=0)
+                try:
+                    import json
+
+                    parsed = json.loads(result)
+                except Exception:
+                    parsed = {"_parse_error": True, "raw": result[:4000]}
+                parsed["_model"] = self._model_for_purpose("json")
+                return parsed
+            except Exception as exc:
+                return {"_error": str(exc)[:500], "_model": self._model_for_purpose("json")}
         if provider == "openai":
+            if config.DISABLE_OPENAI_API:
+                return {"_error": "OpenAI API is disabled by configuration.", "_model": config.OPENAI_JSON_MODEL}
             if not config.OPENAI_API_KEY:
                 return {"_error": "OPENAI_API_KEY is not set.", "_model": config.OPENAI_JSON_MODEL}
             return self._openai().generate_json(
@@ -80,23 +115,6 @@ class ModelGateway:
                 model=config.DEEPSEEK_MODEL_JSON,
                 max_tokens=max_output_tokens,
             )
-        if provider == "codex_cli":
-            result = self._codex_cli().generate_text(
-                prompt=f"{prompt}\n\nReturn only strict JSON.",
-                system=system,
-                model=config.CODEX_CLI_MODEL,
-                max_output_tokens=max_output_tokens,
-            )
-            if not result.ok:
-                return {"_error": result.error, "_model": result.model}
-            try:
-                import json
-
-                parsed = json.loads(result.content)
-            except Exception:
-                parsed = {"_parse_error": True, "raw": result.content[:4000]}
-            parsed["_model"] = result.model
-            return parsed
         return {"_fallback": True, "_model": "local_fallback", "raw": ""}
 
     def summarize_figure(
@@ -114,6 +132,8 @@ class ModelGateway:
             "Return a concise visual summary and mention uncertainty when needed."
         )
         if provider == "openai" and config.ENABLE_OPENAI_VISION:
+            if config.DISABLE_OPENAI_API:
+                return self._caption_nearby_text_fallback(caption, nearby_text, section_path, "OpenAI API is disabled by configuration.")
             if not config.OPENAI_API_KEY:
                 return self._caption_nearby_text_fallback(caption, nearby_text, section_path, "OPENAI_API_KEY is not set.")
             try:
@@ -126,6 +146,8 @@ class ModelGateway:
         if not texts:
             return []
         if config.EMBEDDING_PROVIDER.lower() == "openai":
+            if config.DISABLE_OPENAI_API:
+                raise RuntimeError("OpenAI API is disabled by configuration.")
             if not config.OPENAI_API_KEY:
                 raise RuntimeError("OPENAI_API_KEY is not set.")
             return self._openai().create_embeddings(
@@ -137,22 +159,29 @@ class ModelGateway:
 
     def model_execution_info(self) -> dict[str, Any]:
         embedding_model = config.OPENAI_EMBEDDING_MODEL if config.EMBEDDING_PROVIDER.lower() == "openai" else config.EMBEDDING_MODEL
+        text_provider = _effective_text_provider()
+        vision_provider = _effective_vision_provider()
         fallbacks = []
-        if config.TEXT_MODEL_PROVIDER.lower() == "openai" and not config.OPENAI_API_KEY:
+        if text_provider == "openai" and (config.DISABLE_OPENAI_API or not config.OPENAI_API_KEY):
             fallbacks.append({"type": "openai_key_missing", "message": "OPENAI_API_KEY is not set. Used fallback provider."})
         return {
-            "text_model_provider": config.TEXT_MODEL_PROVIDER,
+            "llm_provider": config.LLM_PROVIDER,
+            "text_model_provider": text_provider,
             "text_model": self._model_for_purpose("chat"),
-            "codex_cli_command": config.CODEX_CLI_COMMAND if config.TEXT_MODEL_PROVIDER.lower() == "codex_cli" else "",
-            "codex_cli_model": config.CODEX_CLI_MODEL if config.TEXT_MODEL_PROVIDER.lower() == "codex_cli" else "",
+            "codex_cli_command": config.CODEX_CLI_COMMAND if text_provider in {"codex", "codex_cli", "codex_runtime"} else "",
+            "codex_text_model": _codex_model_label(config.CODEX_MODEL_TEXT) if text_provider in {"codex", "codex_cli", "codex_runtime"} else "",
+            "codex_vision_model": _codex_model_label(config.CODEX_MODEL_VISION) if vision_provider in {"codex", "codex_cli", "codex_runtime"} else "",
+            "codex_sandbox": config.CODEX_SANDBOX,
+            "codex_timeout_seconds": config.CODEX_TIMEOUT_SECONDS,
+            "disable_openai_api": config.DISABLE_OPENAI_API,
             "openai_api_key_configured": bool(config.OPENAI_API_KEY),
-            "vision_model_provider": config.VISION_MODEL_PROVIDER,
-            "vision_model": config.OPENAI_VISION_MODEL if config.VISION_MODEL_PROVIDER.lower() == "openai" else config.GEMINI_VISION_MODEL,
+            "vision_model_provider": vision_provider,
+            "vision_model": config.OPENAI_VISION_MODEL if vision_provider == "openai" else _codex_model_label(config.CODEX_MODEL_VISION),
             "embedding_provider": config.EMBEDDING_PROVIDER,
             "embedding_model": embedding_model,
             "embedding_dimensions": config.OPENAI_EMBEDDING_DIMENSIONS if config.EMBEDDING_PROVIDER.lower() == "openai" else None,
             "deepseek_api_key_configured": bool(config.DEEPSEEK_API_KEY),
-            "openai_vision_enabled": config.ENABLE_OPENAI_VISION,
+            "openai_vision_enabled": config.ENABLE_OPENAI_VISION and vision_provider == "openai" and not config.DISABLE_OPENAI_API,
             "openai_store_responses": config.OPENAI_STORE_RESPONSES,
             "fallbacks": fallbacks,
         }
@@ -167,14 +196,12 @@ class ModelGateway:
             self._deepseek_client = DeepSeekClient()
         return self._deepseek_client
 
-    def _codex_cli(self) -> CodexCliClient:
-        if self._codex_cli_client is None:
-            self._codex_cli_client = CodexCliClient()
-        return self._codex_cli_client
-
     def _model_for_purpose(self, purpose: str) -> str:
-        if config.TEXT_MODEL_PROVIDER.lower() == "codex_cli":
-            return f"codex_cli:{config.CODEX_CLI_MODEL or 'default'}"
+        provider = _effective_vision_provider() if purpose == "vision" else _effective_text_provider()
+        if provider in {"codex", "codex_cli", "codex_runtime"}:
+            if purpose == "vision":
+                return _codex_model_label(config.CODEX_MODEL_VISION)
+            return _codex_model_label(config.CODEX_MODEL_TEXT)
         if purpose == "note":
             return config.OPENAI_NOTE_MODEL
         if purpose == "json":
@@ -215,3 +242,21 @@ def _safe_provider_error(error: str) -> str:
             error = error.replace(secret, "[redacted]")
     error = re.sub(r"sk-[A-Za-z0-9*_-]{8,}", "[redacted-api-key]", error)
     return error[:500]
+
+
+def _effective_text_provider() -> str:
+    provider = config.TEXT_MODEL_PROVIDER.lower()
+    if config.DISABLE_OPENAI_API and provider == "openai" and config.LLM_PROVIDER.lower() in {"codex", "codex_cli", "codex_runtime"}:
+        return config.LLM_PROVIDER.lower()
+    return provider
+
+
+def _effective_vision_provider() -> str:
+    provider = config.VISION_MODEL_PROVIDER.lower()
+    if config.DISABLE_OPENAI_API and provider == "openai" and config.LLM_PROVIDER.lower() in {"codex", "codex_cli", "codex_runtime"}:
+        return config.LLM_PROVIDER.lower()
+    return provider
+
+
+def _codex_model_label(model: str) -> str:
+    return f"codex:{model or 'default'}"

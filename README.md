@@ -2,7 +2,7 @@
 
 Local Research Agent is a local research-paper assistant. It provides a small paper library, PDF upload, local RAG question answering, Obsidian-compatible note generation, chat sessions, and an inspectable execution panel.
 
-The project is already more than a plain PDF QA demo: it has LangGraph-style agent orchestration, Adaptive Layout-Aware RAG v2, a Note Skill Agent flow, ToolGateway/MCP call records, execution payloads, and persisted chat sessions. The P0 handoff is complete: upload and chat endpoints now enter through `backend/harness/runtime.py`, execution payload building and persistence live under `backend/harness/execution_builder.py`, chat history restores saved assistant execution payloads from `agent_tasks.execution_json`, and deleting a paper cleans paper/note vector records before database rows are removed. The P1 boundary pass is complete as well: Database MCP now exposes named paper/chunk/delete tools, key upload/note/delete database writes use those named wrappers, and trace/MCP/A2A logs share the same redaction helper. The P2 frontend pass is complete: execution payloads now have typed frontend contracts, the execution panel shows readable structured summaries before raw JSON details, and the main chat UI text has been cleaned up. The deeper graph handlers still live in `backend/app.py`, so the next optimization is moving more business orchestration behind Harness.
+The project is already more than a plain PDF QA demo: it has LangGraph-style agent orchestration, Adaptive Layout-Aware RAG v2, a Note Skill Agent flow, ToolGateway/MCP call records, execution payloads, and persisted chat sessions. The P0 handoff is complete: upload and chat endpoints now enter through `backend/harness/runtime.py`, execution payload building and persistence live under `backend/harness/execution_builder.py`, chat history restores saved assistant execution payloads from `agent_tasks.execution_json`, and deleting a paper cleans paper/note vector records before database rows are removed. The P1 boundary pass is complete as well: Database MCP now exposes named paper/chunk/delete tools, key upload/note/delete database writes use those named wrappers, and trace/MCP/A2A logs share the same redaction helper. The P2 frontend pass is complete: execution payloads now have typed frontend contracts, the execution panel shows readable structured summaries before raw JSON details, and the main chat UI text has been cleaned up. The upload/chat LangGraph runner lives in `backend/harness/graph_runner.py`, upload ingest, retrieval, note generation, and answer synthesis live in `backend/harness/agent_service.py`, and paper library/delete workflows live in `backend/harness/library_service.py`; `backend/app.py` is now mostly the FastAPI boundary.
 
 ## Current Core Capabilities
 
@@ -30,7 +30,6 @@ backend/
   graph/
   harness/
   llm/
-  mcp_client/
   mcp_servers/
   tests/
   note_skill.py
@@ -44,6 +43,7 @@ backend/
   vector_store.py
 frontend/
   src/
+    api/researchAgent.ts
     components/ExecutionPanel.vue
     views/MainChatView.vue
     App.vue
@@ -67,8 +67,9 @@ Important path notes:
 - Database code is currently `backend/database.py` and `backend/schema.sql`.
 - `ToolGateway` is currently implemented in `backend/tool_gateway.py`.
 - MCP tools are currently in-process Python wrappers under `backend/mcp_servers/`; they are not independent MCP service processes.
+- The old `backend/mcp_client/` compatibility facade has been removed; current code uses `backend/tool_gateway.py` directly through Harness and service layers.
 - `backend/rag/`, `backend/skills/`, and `backend/database/` are not current real directories.
-- `frontend/src/api/` and `frontend/src/stores/` are not current real directories; API calls and state are mostly inside `frontend/src/views/MainChatView.vue`.
+- `frontend/src/api/researchAgent.ts` owns frontend API calls; UI state remains inside `frontend/src/views/MainChatView.vue`, and `frontend/src/stores/` is not a current real directory.
 
 ## Architecture
 
@@ -77,7 +78,7 @@ Frontend
 -> FastAPI backend/app.py
    -> Harness Runtime backend/harness/runtime.py
       -> task/session/run initialization
-      -> upload/chat graph runner callbacks
+      -> upload/chat graph execution through backend/harness/graph_runner.py
    -> LangGraph-style flow
       -> Knowledge RAG Agent
          -> PDF parsing, layout artifacts, chunks, retrieval
@@ -95,11 +96,14 @@ Current boundary:
 - `backend/harness/runtime.py` is now the upload/chat task entrypoint used by the API endpoints.
 - `backend/harness/execution_builder.py` now owns full execution payload construction and `agent_tasks.execution_json` persistence.
 - `backend/chat_sessions.py` now owns chat session listing, creation, deletion, history loading, and historical execution restore.
-- `backend/app.py` still owns FastAPI validation plus the graph runner callbacks and several business handlers.
+- `backend/harness/graph_runner.py` now owns upload/chat state initialization, LangGraph invocation, ToolGateway creation, and node trace ordering.
+- `backend/harness/agent_service.py` now owns upload ingest, adaptive retrieval calls, note generation, answer synthesis, and graph handler assembly.
+- `backend/harness/library_service.py` now owns folders, papers, paper search, paper details, paper deletion, artifact cleanup, and vector cleanup.
+- `backend/app.py` now owns FastAPI validation plus thin endpoint wrappers.
 - `backend/harness/` contains useful policy, context, security, fallback, and execution-builder helpers.
 - `backend/mcp_servers/database_mcp_server.py` now contains named `insert_paper`, `insert_chunks`, `insert_note`, `insert_note_chunks`, `update_paper_status`, and `delete_paper_artifacts` helpers.
 - `backend/database.py` applies shared redaction to trace, MCP, and A2A log records.
-- The next Harness optimization is moving more graph handlers and business orchestration out of `app.py` so the API layer becomes thinner.
+- The unused `backend/graph/checkpoint.py` snapshot helper has been removed after confirming there were no in-repo imports.
 - ToolGateway is the current tool-call boundary for key MCP-style file, database, RAG, skill, and model operations.
 
 ## Adaptive Layout-Aware RAG v2
@@ -164,6 +168,9 @@ Harness-related files currently exist under `backend/harness/`:
 - `security.py`
 - `fallback_manager.py`
 - `runtime.py`
+- `graph_runner.py`
+- `agent_service.py`
+- `library_service.py`
 
 `backend/harness/runtime.py` is now the first upload/chat runtime controller. It provides `run_upload_task()` and `run_chat_task()`, and the FastAPI upload/chat endpoints call those functions instead of creating task/session/run records directly.
 
@@ -172,15 +179,15 @@ The current Runtime responsibilities are:
 - Create task and run IDs.
 - Resolve and touch chat sessions.
 - Persist task rows before execution.
-- Invoke the upload/chat graph runner callbacks.
+- Invoke the upload/chat graph runner in `backend/harness/graph_runner.py`.
 - Collect evidence, skill phases, fallbacks, retrieval metadata, and note generation metadata from the final graph state.
 - Build and save the execution payload through `backend/harness/execution_builder.py`.
 - Return API-ready response objects.
 
-The next major architecture step is to move more of the graph and business orchestration behind Harness Runtime so that:
+The current Harness boundary now keeps the main app layer thin:
 
 - `backend/app.py` only handles FastAPI request validation and response return.
-- Harness owns more LangGraph invocation details directly.
+- Harness services own upload/chat and library/delete workflows.
 - Tool calls consistently go through `backend/tool_gateway.py`.
 - traces, MCP calls, A2A messages, fallbacks, redaction, and execution payloads are built consistently.
 
@@ -227,7 +234,33 @@ The response includes a `vector_cleanup` list with per-target status. If the vec
 
 ## Configure Model Providers
 
-OpenAI can be used for chat answers, note generation, JSON-style model tasks, optional vision, and optional embeddings. API keys must stay on the backend side and must not be put in frontend code, execution payloads, traces, or committed files.
+The default LLM backend is the local Codex runtime on a machine that is already signed in to Codex. The default local demo path does not read `OPENAI_API_KEY` and does not consume OpenAI API quota. This is intended for a local single-user demo, not a public high-concurrency production service.
+
+Before starting the backend, sign in to Codex locally in the same user environment. Then start the app from the project Conda environment:
+
+```powershell
+conda activate agent
+```
+
+Default model/runtime settings:
+
+```env
+LLM_PROVIDER=codex
+DISABLE_OPENAI_API=true
+TEXT_MODEL_PROVIDER=codex
+VISION_MODEL_PROVIDER=codex
+ENABLE_OPENAI_VISION=false
+CODEX_CLI_COMMAND=codex
+CODEX_MODEL_TEXT=
+CODEX_MODEL_VISION=
+CODEX_SANDBOX=read_only
+CODEX_TIMEOUT_SECONDS=180
+CODEX_MAX_CONCURRENCY=1
+```
+
+PDF multimodal support does not add user image upload. Images are automatically derived from uploaded PDFs by extracting embedded images or rendering relevant PDF pages under `data/vision/`. If Codex is unavailable or a vision call fails, the system records the fallback in the execution payload and falls back to local RAG/text evidence where possible.
+
+OpenAI remains optional for development, but it is not the default. API keys must stay on the backend side and must not be put in frontend code, execution payloads, traces, or committed files.
 
 PowerShell example:
 
@@ -248,13 +281,77 @@ $env:TEXT_MODEL_PROVIDER="deepseek"
 $env:DEEPSEEK_MODEL_CHAT="deepseek-chat"
 ```
 
-Codex CLI can be tested as a local text provider when the machine is already authenticated:
+Legacy Codex CLI provider names remain accepted for compatibility when the machine is already authenticated:
 
 ```env
-TEXT_MODEL_PROVIDER=codex_cli
+LLM_PROVIDER=codex
+DISABLE_OPENAI_API=true
+TEXT_MODEL_PROVIDER=codex
+VISION_MODEL_PROVIDER=codex
+ENABLE_OPENAI_VISION=false
 CODEX_CLI_COMMAND=codex
-CODEX_CLI_TIMEOUT_SECONDS=180
+CODEX_TIMEOUT_SECONDS=180
 ```
+
+PDF vision asset settings:
+
+```env
+PDF_IMAGE_EXTRACT_ENABLED=true
+PDF_PAGE_RENDER_ENABLED=true
+PDF_IMAGE_MIN_WIDTH=120
+PDF_IMAGE_MIN_HEIGHT=120
+PDF_RENDER_DPI=160
+MAX_PDF_IMAGES_PER_PAPER=40
+MAX_VISION_IMAGES_PER_CALL=4
+```
+
+### Codex 登录方式排查
+
+This project defaults to the Codex local runtime and does not use `OPENAI_API_KEY` for the local demo. If Codex was previously configured with an API key, stale shell variables or an old Codex auth cache can make the CLI behave like an API-key login even after the app is configured for `LLM_PROVIDER=codex`.
+
+Before starting FastAPI, use the same PowerShell session/environment and clear OpenAI API variables:
+
+```powershell
+$env:OPENAI_API_KEY=$null
+$env:OPENAI_BASE_URL=$null
+$env:OPENAI_ORG_ID=$null
+$env:OPENAI_PROJECT=$null
+$env:LLM_PROVIDER="codex"
+$env:DISABLE_OPENAI_API="true"
+```
+
+Then check the local Codex CLI:
+
+```powershell
+where codex
+codex --version
+codex "只回答 OK"
+codex --image "<absolute-path-to-data\vision\...\some.png>" "描述这张图"
+```
+
+In non-interactive shells, use `codex exec --ephemeral --sandbox read-only -` and pipe a short prompt into stdin.
+
+If you previously used API-key login and the diagnostics indicate an API-key-like auth cache, close Codex/FastAPI/frontend processes, back up the cache, then sign in again with ChatGPT/Plus:
+
+```powershell
+ren "$env:USERPROFILE\.codex\auth.json" "auth.json.bak"
+codex
+```
+
+Choose ChatGPT / Plus account login, not API key login. After manual `codex --image ...` succeeds, restart FastAPI. If the manual Codex vision command still fails, the problem is the local Codex environment/login state rather than Local Research Agent business logic.
+
+The backend also exposes a safe diagnostic endpoint:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/codex/health
+Invoke-RestMethod "http://127.0.0.1:8000/api/codex/health?run_probes=true"
+```
+
+The default call is a fast, safe diagnosis. `run_probes=true` also runs real `codex exec` text and image probes, which may take longer if local Codex login is broken. The endpoint reports whether Codex is found, whether OpenAI API environment variables are present, whether an auth cache exists, safe top-level auth field names, text/vision probe status, and a recommendation. It never returns token or key values.
+
+If `env_openai_api_key_present=true`, check both the current PowerShell session and `backend/.env`. When `DISABLE_OPENAI_API=true`, Local Research Agent strips OpenAI API variables from Codex subprocess calls, but clearing the variables before starting the demo keeps diagnostics unambiguous.
+
+Probe commands run from `data/codex_probe_workspace` with `--ephemeral --sandbox read-only --skip-git-repo-check`. They do not pass `--model` unless `CODEX_PROBE_MODEL` is explicitly set.
 
 ## Configure Obsidian
 
@@ -347,6 +444,6 @@ npm run build
 - Search only supports title and author fields.
 - OCR fallback is disabled by default.
 - Word export is not implemented.
-- Table and figure extraction is caption/nearby-text based; it does not claim visual understanding.
+- Table and figure text extraction is caption/nearby-text based. Vision chat can inspect PDF-derived images/pages through local Codex when available, and falls back to local RAG if Codex vision fails.
 - MCP is in-process Python wrapper code plus ToolGateway records, not independent service processes.
-- Harness Runtime is now the upload/chat task entrypoint and owns execution payload persistence through `backend/harness/execution_builder.py`, but deeper graph handlers and business orchestration still need to move out of `backend/app.py`.
+- Harness Runtime is now the upload/chat task entrypoint, owns execution payload persistence through `backend/harness/execution_builder.py`, delegates LangGraph execution to `backend/harness/graph_runner.py`, delegates upload/chat business handling to `backend/harness/agent_service.py`, and keeps library/delete workflows in `backend/harness/library_service.py`.

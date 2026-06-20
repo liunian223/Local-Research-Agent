@@ -6,8 +6,9 @@ from typing import Any
 POLICY_RULES: dict[str, dict[str, set[str]]] = {
     "Knowledge RAG Agent": {
         "file": {"save_uploaded_pdf", "read_pdf_text", "write_parsed_text"},
-        "database": {"find_existing_paper", "insert_paper", "insert_chunks", "delete_paper_artifacts", "update_paper_status", "list_papers_by_folder"},
+        "database": {"find_existing_paper", "insert_paper", "insert_chunks", "insert_image_assets", "delete_paper_artifacts", "update_paper_status", "list_papers_by_folder"},
         "rag": {"parse_layout_document", "build_vector_index", "adaptive_retrieve", "retrieve_structured_evidence"},
+        "vision": {"extract_pdf_images"},
         "a2a": {"*"},
     },
     "Note Skill Agent": {
@@ -15,7 +16,7 @@ POLICY_RULES: dict[str, dict[str, set[str]]] = {
         "file": {"write_markdown_note", "copy_pdf_to_obsidian", "read_markdown_note"},
         "database": {"insert_note", "insert_note_chunks", "update_paper_status"},
         "rag": {"build_note_vector_index"},
-        "llm": {"model_chat", "model_note_generation"},
+        "llm": {"model_chat", "model_note_generation", "codex_vision_chat"},
         "a2a": {"*"},
     },
     "Harness": {
@@ -24,6 +25,7 @@ POLICY_RULES: dict[str, dict[str, set[str]]] = {
         "rag": {"*"},
         "skills": {"*"},
         "llm": {"*"},
+        "vision": {"*"},
         "a2a": {"*"},
     },
 }

@@ -229,6 +229,8 @@ def rag_pipeline_summary(conn: Any, paper_id: str | None = None) -> dict[str, An
         "chunk_strategy": "semantic_layout",
         "vector_backend": VECTOR_STORE.backend,
         "keyword_fallback_used": VECTOR_STORE.collection is None,
+        "backend_config": VECTOR_STORE.backend_config(),
+        "backend_status": VECTOR_STORE.backend_status(),
         "page_count": count("document_pages"),
         "section_count": count("document_sections"),
         "text_chunk_count": text_chunk_count,
@@ -244,9 +246,20 @@ def build_meta(plan: dict[str, Any], rows: list[dict[str, Any]], evidence: list[
     retrieved_tables = sorted({table_id for item in evidence for table_id in _metadata_list(item, "table_ids")})
     retrieved_figures = sorted({figure_id for item in evidence for figure_id in _metadata_list(item, "figure_ids")})
     pages = sorted({page for item in evidence for page in [item.get("page_start"), item.get("page_end")] if page})
+    backend_status = VECTOR_STORE.backend_status()
     return {
         "backend": backend,
+        "backend_status": backend_status,
+        "backend_config": VECTOR_STORE.backend_config(),
+        "backend_diagnostics": {
+            "configured_backend": backend_status.get("configured_backend"),
+            "actual_backend": backend,
+            "fallback_reason": backend_status.get("fallback_reason"),
+            "exception_class": backend_status.get("exception_class"),
+            "exception_message": backend_status.get("exception_message"),
+        },
         "fallback": fallback,
+        "fallback_reason": backend_status.get("fallback_reason") if fallback else "",
         "keyword_fallback_used": fallback or backend == "local_keyword",
         "retrieval_mode": plan.get("mode"),
         "retrieval_intent": plan.get("intent"),
@@ -255,8 +268,37 @@ def build_meta(plan: dict[str, Any], rows: list[dict[str, Any]], evidence: list[
         "retrieved_figures": retrieved_figures,
         "retrieved_pages": pages,
         "candidate_count": len(rows),
+        "evidence_stats": evidence_type_stats(evidence),
         "fallbacks": fallbacks,
     }
+
+
+def evidence_type_stats(evidence: list[dict[str, Any]]) -> dict[str, int]:
+    stats = {
+        "text_chunks": 0,
+        "section_summaries": 0,
+        "abstract_chunks": 0,
+        "tables": 0,
+        "figures": 0,
+        "pages": 0,
+    }
+    for item in evidence:
+        source_type = item.get("source_type") or "text"
+        metadata = item.get("metadata") or {}
+        is_abstract = bool(item.get("is_abstract") or metadata.get("is_abstract")) or str(item.get("chunk_role") or metadata.get("chunk_role") or "").lower() == "abstract"
+        if is_abstract:
+            stats["abstract_chunks"] += 1
+        elif source_type == "section_summary":
+            stats["section_summaries"] += 1
+        elif source_type == "table":
+            stats["tables"] += 1
+        elif source_type == "figure":
+            stats["figures"] += 1
+        elif source_type == "page_summary":
+            stats["pages"] += 1
+        else:
+            stats["text_chunks"] += 1
+    return stats
 
 
 def rerank_with_intent(query: str, evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:

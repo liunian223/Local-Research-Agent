@@ -19,8 +19,8 @@ def test_delete_paper_invokes_vector_cleanup(monkeypatch, tmp_path: Path) -> Non
         calls.append(("note", note_id))
         return {"backend": "test", "status": "done", "deleted_count": 1}
 
-    monkeypatch.setattr("app.VECTOR_STORE.delete_by_paper_id", fake_delete_by_paper_id)
-    monkeypatch.setattr("app.VECTOR_STORE.delete_by_note_id", fake_delete_by_note_id)
+    monkeypatch.setattr("harness.library_service.VECTOR_STORE.delete_by_paper_id", fake_delete_by_paper_id)
+    monkeypatch.setattr("harness.library_service.VECTOR_STORE.delete_by_note_id", fake_delete_by_note_id)
 
     with TestClient(app) as client:
         pdf = make_pdf(
@@ -46,8 +46,8 @@ def test_delete_paper_continues_when_vector_cleanup_fails(monkeypatch, tmp_path:
     def failing_delete_by_paper_id(paper_id: str) -> dict:
         raise RuntimeError("vector unavailable")
 
-    monkeypatch.setattr("app.VECTOR_STORE.delete_by_paper_id", failing_delete_by_paper_id)
-    monkeypatch.setattr("app.VECTOR_STORE.delete_by_note_id", lambda note_id: {"backend": "test", "status": "done", "deleted_count": 0})
+    monkeypatch.setattr("harness.library_service.VECTOR_STORE.delete_by_paper_id", failing_delete_by_paper_id)
+    monkeypatch.setattr("harness.library_service.VECTOR_STORE.delete_by_note_id", lambda note_id: {"backend": "test", "status": "done", "deleted_count": 0})
 
     with TestClient(app) as client:
         pdf = make_pdf(

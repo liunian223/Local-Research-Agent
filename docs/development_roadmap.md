@@ -41,13 +41,13 @@
 
 ## 6. 下一步建议
 
-- 继续让 `backend/app.py` 变薄：优先迁移 `run_upload_graph()`、`run_chat_graph()` 或其中一个 handler 到 Harness/Agent service 层。
-- 继续清理兼容 facade：评估 `backend/mcp_client/client_manager.py` 和 `backend/mcp_client/tool_invoker.py` 是否仍有外部依赖。
-- 只在确实需要时做前端分层，暂不主动拆 `frontend/src/api` 和 stores。
+- `backend/app.py` 变薄已继续完成：upload/chat 业务在 `backend/harness/agent_service.py`，library/delete 业务在 `backend/harness/library_service.py`。
+- 兼容 facade 清理已完成：`backend/mcp_client/client_manager.py`、`backend/mcp_client/tool_invoker.py` 和空包入口已删除，当前统一直接使用 `backend/tool_gateway.py`。
+- 前端 API 分层已完成：`frontend/src/api/researchAgent.ts` 负责请求，`MainChatView.vue` 保留 UI 状态；暂不主动拆 stores。
 
 ## 7. 暂不做
 
-- 不拆 `frontend/src/api` 和 stores。
+- 暂不拆 `frontend/src/stores`；当前 UI 状态仍集中在 `MainChatView.vue`。
 - 不拆 `backend/database` 包。
 - 不强行新建 `backend/rag` 包。
 - 不做独立 MCP server 进程。

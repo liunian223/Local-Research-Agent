@@ -1,0 +1,3 @@
+{"id":"q001","scope":"paper_only","paper_id":"replace_with_existing_paper_id","query":"What method does this paper use?","gold_sections":["method"],"gold_keywords":["method","model","approach"]}
+{"id":"q002","scope":"paper_only","paper_id":"replace_with_existing_paper_id","query":"How are the experiments and results described?","gold_sections":["experiment","result"],"gold_keywords":["experiment","accuracy","result"]}
+{"id":"q003","scope":"paper_only","paper_id":"replace_with_existing_paper_id","query":"What does Table 2 show?","gold_evidence_types":["table"],"gold_keywords":["Table 2","baseline","accuracy"]}

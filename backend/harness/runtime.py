@@ -50,7 +50,9 @@ def run_upload_task(
         evidence = final_state.get("rag_evidence", [])
         skill_phases = final_state.get("skill_phases", [])
         fallbacks = final_state.get("fallbacks", [])
-        conn.execute("UPDATE agent_tasks SET status = ?, current_paper_id = ?, answer = ?, updated_at = ? WHERE id = ?", ("done", paper["id"], answer, now_iso(), task_id))
+        note_generation = final_state.get("note_generation") or {}
+        task_status = final_state.get("task_status") or ("partial" if message_type == "partial_success" or note_generation.get("status") == "partial" else "done")
+        conn.execute("UPDATE agent_tasks SET status = ?, current_paper_id = ?, answer = ?, updated_at = ? WHERE id = ?", (task_status, paper["id"], answer, now_iso(), task_id))
         touch_session_fn(conn, resolved_session_id, message or paper.get("title", "") or file_name or "")
         execution = execution_builder(
             conn,
@@ -60,7 +62,9 @@ def run_upload_task(
             fallbacks,
             final_state.get("retrieval") or final_state.get("retrieve_meta") or {},
             paper.get("id"),
-            final_state.get("note_generation") or {},
+            note_generation,
+            final_state.get("vision_execution") or {},
+            final_state.get("pdf_image_extraction") or {},
         )
         save_execution_fn(conn, task_id, execution)
     return {
@@ -110,7 +114,9 @@ def run_chat_task(
         answer = final_state.get("answer") or "任务执行中止：检测到异常循环。"
         message_type = final_state.get("message_type") or "assistant_answer"
 
-        conn.execute("UPDATE agent_tasks SET status = ?, answer = ?, updated_at = ? WHERE id = ?", ("done", answer, now_iso(), task_id))
+        note_generation = final_state.get("note_generation") or {}
+        task_status = final_state.get("task_status") or ("partial" if message_type == "partial_success" or note_generation.get("status") == "partial" else "done")
+        conn.execute("UPDATE agent_tasks SET status = ?, answer = ?, updated_at = ? WHERE id = ?", (task_status, answer, now_iso(), task_id))
         touch_session_fn(conn, resolved_session_id, payload.message)
         execution = execution_builder(
             conn,
@@ -120,7 +126,9 @@ def run_chat_task(
             fallbacks,
             final_state.get("retrieval") or final_state.get("retrieve_meta") or {},
             paper.get("id") if paper else None,
-            final_state.get("note_generation") or {},
+            note_generation,
+            final_state.get("vision_execution") or {},
+            final_state.get("pdf_image_extraction") or {},
         )
         save_execution_fn(conn, task_id, execution)
     return {

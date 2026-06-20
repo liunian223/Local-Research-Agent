@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+from pathlib import Path
 from typing import Any
 
 import config
@@ -13,6 +15,9 @@ class VectorStore:
     def __init__(self) -> None:
         self.backend = "local_keyword"
         self.collection = None
+        self.init_exception_class = ""
+        self.init_exception_message = ""
+        self.fallback_reason = ""
         if config.VECTOR_BACKEND.lower() == "chroma":
             try:
                 import chromadb
@@ -23,9 +28,37 @@ class VectorStore:
                     metadata={"hnsw:space": "cosine"},
                 )
                 self.backend = "chroma"
-            except Exception:
+            except Exception as exc:
                 self.collection = None
                 self.backend = "local_keyword"
+                self.init_exception_class = exc.__class__.__name__
+                self.init_exception_message = str(exc)[:300]
+                self.fallback_reason = f"chroma_init_failed:{self.init_exception_class}"
+        else:
+            self.fallback_reason = "configured_backend_is_not_chroma"
+
+    def backend_config(self) -> dict[str, Any]:
+        return {
+            "configured_backend": config.VECTOR_BACKEND,
+            "embedding_provider": config.EMBEDDING_PROVIDER,
+            "embedding_model": config.OPENAI_EMBEDDING_MODEL if config.EMBEDDING_PROVIDER.lower() == "openai" else config.EMBEDDING_MODEL,
+            "chroma_persist_directory": str(config.VECTOR_DIR),
+        }
+
+    def backend_status(self) -> dict[str, Any]:
+        return {
+            "configured_backend": config.VECTOR_BACKEND,
+            "actual_backend": self.backend,
+            "embedding_provider": config.EMBEDDING_PROVIDER,
+            "embedding_model": config.OPENAI_EMBEDDING_MODEL if config.EMBEDDING_PROVIDER.lower() == "openai" else config.EMBEDDING_MODEL,
+            "chroma_persist_directory": str(config.VECTOR_DIR),
+            "chroma_persist_directory_exists": Path(config.VECTOR_DIR).exists(),
+            "chroma_persist_directory_writable": _path_writable(Path(config.VECTOR_DIR)),
+            "fallback": self.collection is None,
+            "fallback_reason": self.fallback_reason,
+            "exception_class": self.init_exception_class,
+            "exception_message": self.init_exception_message,
+        }
 
     def index_chunks(self, chunks: list[dict[str, Any]], source_type: str, paper_id: str, note_id: str = "") -> dict[str, Any]:
         if not chunks:
@@ -67,19 +100,30 @@ class VectorStore:
         except Exception as exc:
             self.collection = None
             self.backend = "local_keyword"
+            self.init_exception_class = exc.__class__.__name__
+            self.init_exception_message = str(exc)[:300]
+            self.fallback_reason = f"chroma_upsert_failed:{self.init_exception_class}"
             return {
                 "backend": self.backend,
                 "indexed": len(chunks),
                 "status": "fallback_index_recorded",
+                "fallback_reason": self.fallback_reason,
+                "exception_class": self.init_exception_class,
                 "error": str(exc)[:300],
             }
 
     def retrieve(self, query: str, rows: list[dict[str, Any]], top_k: int | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         top_k = top_k or config.RAG_TOP_K
         if not rows:
-            return [], {"backend": self.backend, "fallback": self.collection is None}
+            return [], {"backend": self.backend, "fallback": self.collection is None, "fallback_reason": self.fallback_reason}
         if self.collection is None:
-            return score_chunks(query, rows, top_k), {"backend": self.backend, "fallback": True}
+            return score_chunks(query, rows, top_k), {
+                "backend": self.backend,
+                "fallback": True,
+                "fallback_reason": self.fallback_reason,
+                "exception_class": self.init_exception_class,
+                "error": self.init_exception_message,
+            }
 
         where = build_where(rows)
         try:
@@ -114,7 +158,18 @@ class VectorStore:
                 )
             return evidence, {"backend": self.backend, "fallback": False}
         except Exception as exc:
-            return score_chunks(query, rows, top_k), {"backend": "local_keyword", "fallback": True, "error": str(exc)[:300]}
+            self.collection = None
+            self.backend = "local_keyword"
+            self.init_exception_class = exc.__class__.__name__
+            self.init_exception_message = str(exc)[:300]
+            self.fallback_reason = f"chroma_query_failed:{self.init_exception_class}"
+            return score_chunks(query, rows, top_k), {
+                "backend": "local_keyword",
+                "fallback": True,
+                "fallback_reason": self.fallback_reason,
+                "exception_class": self.init_exception_class,
+                "error": self.init_exception_message,
+            }
 
     def delete_by_paper_id(self, paper_id: str) -> dict[str, Any]:
         return self._delete_by_metadata("paper_id", paper_id)
@@ -153,6 +208,11 @@ def build_where(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if chunk_ids:
         return {"chunk_id": {"$in": chunk_ids}}
     return {}
+
+
+def _path_writable(path: Path) -> bool:
+    probe = path if path.exists() else path.parent
+    return probe.exists() and os.access(probe, os.W_OK)
 
 
 VECTOR_STORE = VectorStore()

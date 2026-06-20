@@ -174,6 +174,24 @@ CREATE TABLE IF NOT EXISTS document_figures (
 CREATE INDEX IF NOT EXISTS idx_document_figures_paper_id ON document_figures(paper_id);
 CREATE INDEX IF NOT EXISTS idx_document_figures_page ON document_figures(paper_id, page_number);
 
+CREATE TABLE IF NOT EXISTS image_assets (
+  id TEXT PRIMARY KEY,
+  paper_id TEXT NOT NULL,
+  page_no INTEGER,
+  image_index INTEGER,
+  image_path TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  width INTEGER,
+  height INTEGER,
+  caption TEXT,
+  created_at TEXT,
+  FOREIGN KEY(paper_id) REFERENCES papers(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_image_assets_paper_id ON image_assets(paper_id);
+CREATE INDEX IF NOT EXISTS idx_image_assets_page ON image_assets(paper_id, page_no);
+CREATE INDEX IF NOT EXISTS idx_image_assets_source ON image_assets(source_type);
+
 CREATE TABLE IF NOT EXISTS document_chunks (
   id TEXT PRIMARY KEY,
   paper_id TEXT NOT NULL,

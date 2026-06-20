@@ -19,7 +19,6 @@ backend/
   graph/
   harness/
   llm/
-  mcp_client/
   mcp_servers/
   tests/
   note_skill.py
@@ -33,6 +32,7 @@ backend/
   vector_store.py
 frontend/
   src/
+    api/researchAgent.ts
     components/ExecutionPanel.vue
     views/MainChatView.vue
     App.vue
@@ -51,11 +51,11 @@ obsidian_vault/
 
 | 模块 | 当前代码状态 | 完成度 | 后续问题 | 优先级 |
 |---|---|---|---|---|
-| Harness Runtime | `backend/harness/runtime.py` 提供 `run_upload_task()` / `run_chat_task()` 并被 API 调用 | 已完成 P0 | deeper graph handlers 仍在 `app.py` | Done |
-| LangGraph 风格 Agent 编排 | `backend/graph/`、`backend/agents/` 存在，节点路由可运行 | 已完成 | Agent 节点偏薄，业务 handler 仍较多在 `app.py` | P1/P3 |
+| Harness Runtime | `backend/harness/runtime.py` 提供 `run_upload_task()` / `run_chat_task()` 并被 API 调用 | 已完成 P0 | upload/chat 与 library/delete service boundaries 已下沉到 `backend/harness/` | Done |
+| LangGraph 风格 Agent 编排 | `backend/graph/`、`backend/agents/` 存在，节点路由可运行 | 已完成 | 业务 handler 已迁到 `backend/harness/agent_service.py` | Done |
 | ToolGateway / MCP | `backend/tool_gateway.py` 记录调用，Database MCP 已补齐关键具名工具 | 已完成 P1 | 更深层业务编排仍可继续收敛 | Done |
 | Adaptive Layout-Aware RAG v2 | `backend/adaptive_rag/`、`layout_parser.py`、`semantic_chunker.py`、`structured_retriever.py` 已存在 | 已完成 | 不应再把 `backend/rag/` 写作当前目录 | Done |
-| Note Skill Agent v1.4 | `backend/note_skill.py` 与 `backend/app.py.generate_note()` 串起主流程 | 已完成 | orchestration 仍在 `app.py` | P1/P3 |
+| Note Skill Agent v1.4 | `backend/note_skill.py` 与 `backend/harness/agent_service.py` 串起主流程 | 已完成 | 后续可再细分 note helper，但不是结构阻塞 | Done |
 | Chat sessions | `backend/chat_sessions.py`、`chat_sessions`、`agent_tasks.session_id`、session API 存在 | 已完成 P0 | 可继续做 UX 优化 | Done |
 | Execution panel | `ExecutionPanel.vue` 已改为 `ExecutionPayload` typed prop，并提供结构化摘要 | 已完成 P2 | 后续可做更精细 UI，但不是结构阻塞 | Done |
 | 前端主界面 | `MainChatView.vue` 保留现有 API/state 逻辑，已清理可见乱码 | 已完成 P2 | 暂不拆 `api/` 和 stores | Done |
@@ -68,7 +68,7 @@ obsidian_vault/
 | `backend/rag/` | 不存在；真实实现为 `backend/adaptive_rag/`、`backend/structured_retriever.py`、`backend/rag.py` |
 | `backend/skills/` | 不存在；真实 Skill 实现在 `backend/note_skill.py` |
 | `backend/database/` | 不存在；真实数据库实现为 `backend/database.py` 和 `backend/schema.sql` |
-| `frontend/src/api/` | 不存在；请求逻辑目前主要在 `MainChatView.vue` |
+| `frontend/src/api/` | 已存在；`researchAgent.ts` 负责前端 API 请求 |
 | `frontend/src/stores/` | 不存在；状态目前主要在 `MainChatView.vue` |
 
 ## 5. P0/P1/P2 验收状态
@@ -89,9 +89,9 @@ obsidian_vault/
 
 | 目标 | 涉及文件 | 建议 |
 |---|---|---|
-| 继续 app.py 变薄 | `backend/app.py`、`backend/harness/`、`backend/agents/` | 迁移 `run_upload_graph()`、`run_chat_graph()` 或其中一个 handler |
-| 清理兼容 facade | `backend/mcp_client/client_manager.py`、`backend/mcp_client/tool_invoker.py` | 确认无外部依赖后再删除 |
-| 前端分层 | `frontend/src/views/MainChatView.vue` | 等功能继续增长后再拆 `api/` 或 stores |
+| 继续 app.py 变薄 | `backend/app.py`、`backend/harness/agent_service.py`、`backend/harness/library_service.py` | 已迁移 upload/chat 和 library/delete orchestration |
+| 清理兼容 facade | `backend/mcp_client/client_manager.py`、`backend/mcp_client/tool_invoker.py` | 已确认无主流程依赖并删除；当前统一使用 `backend/tool_gateway.py` |
+| 前端分层 | `frontend/src/api/researchAgent.ts`、`frontend/src/views/MainChatView.vue` | API 层已拆；stores 等状态更复杂后再拆 |
 
 ## 7. 文档一致性结论
 

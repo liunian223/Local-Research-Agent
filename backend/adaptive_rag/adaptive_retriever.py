@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 import config
-from structured_retriever import build_meta, collect_structured_scope_chunks
+from structured_retriever import build_meta, collect_structured_scope_chunks, evidence_type_stats
+from vector_store import VECTOR_STORE
 
 from .evidence_checker import check_coverage
 from .evidence_fusion import build_adaptive_evidence_bundle, dedupe_evidence, limit_abstract_evidence
@@ -15,6 +16,12 @@ from .reranker import rerank
 def adaptive_retrieve(conn: Any, scope: str, paper_id: str | None, query: str, top_k: int | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     top_k = top_k or config.RAG_TOP_K
     analysis = analyze_query(query, scope)
+    analysis = {
+        **analysis,
+        "query_type": analysis.get("intent") or "unknown",
+        "is_complex": analysis.get("complexity") == "complex",
+        "scope": scope,
+    }
     retrieval_mode = "complex_planned_retrieval" if analysis["complexity"] == "complex" else "simple_retrieve_rerank"
     if analysis.get("needs_page"):
         retrieval_mode = "page_lookup"
@@ -62,10 +69,24 @@ def adaptive_retrieve(conn: Any, scope: str, paper_id: str | None, query: str, t
             "legacy_mode": _legacy_mode(retrieval_mode, analysis),
             "query_analysis": analysis,
             "retrieval_plan": {
+                "mode": retrieval_mode,
+                "top_k": final_top_k,
+                "candidate_top_k": candidate_top_k,
+                "reason": _retrieval_reason(retrieval_mode, analysis),
                 "sub_questions": analysis.get("sub_questions", []),
                 "query_rewrites": analysis.get("query_rewrites", []),
                 "coverage_requirements": {"target_sections": analysis.get("target_sections", [])},
             },
+            "backend_diagnostics": {
+                "configured_backend": VECTOR_STORE.backend_config().get("configured_backend"),
+                "actual_backend": backend_meta.get("backend") or VECTOR_STORE.backend,
+                "fallback_reason": backend_meta.get("fallback_reason") or VECTOR_STORE.backend_status().get("fallback_reason"),
+                "exception_class": backend_meta.get("exception_class") or VECTOR_STORE.backend_status().get("exception_class"),
+                "exception_message": backend_meta.get("error") or VECTOR_STORE.backend_status().get("exception_message"),
+            },
+            "fallback_reason": backend_meta.get("fallback_reason") or (VECTOR_STORE.backend_status().get("fallback_reason") if backend_meta.get("fallback") else ""),
+            "retrieval_error": backend_meta.get("error") or "",
+            "evidence_stats": evidence_type_stats(evidence),
             "abstract_control": {
                 "has_abstract": _has_abstract(conn, paper_id),
                 "abstract_mode": analysis.get("abstract_mode"),
@@ -79,6 +100,21 @@ def adaptive_retrieve(conn: Any, scope: str, paper_id: str | None, query: str, t
     )
     meta["evidence_bundle"] = build_adaptive_evidence_bundle(evidence, meta)
     return evidence, meta
+
+
+def _retrieval_reason(mode: str, analysis: dict[str, Any]) -> str:
+    if mode == "page_lookup":
+        return "query asks for a page-specific answer"
+    if mode == "table_lookup":
+        return "query asks for table evidence"
+    if mode == "figure_lookup":
+        return "query asks for figure or caption evidence"
+    if mode == "global_structured_retrieval":
+        return "global library scope with a complex synthesis query"
+    if mode == "complex_planned_retrieval":
+        sections = ", ".join(analysis.get("target_sections") or [])
+        return f"complex query requires section coverage{': ' + sections if sections else ''}"
+    return "simple query can use hybrid retrieve and rerank"
 
 
 def _second_pass(conn: Any, scope: str, paper_id: str | None, query: str, analysis: dict[str, Any], coverage: dict[str, Any]) -> list[dict[str, Any]]:

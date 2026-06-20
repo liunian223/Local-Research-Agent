@@ -1,0 +1,265 @@
+你现在在本地项目 `C:/Users/liunian/Documents/Agent` 中工作。请不要直接大规模重构，先做“本地搜查 + 诊断 + 小步优化”。当前项目的 RAG 已经不是简单 PDF 切块 top-k，而是 Adaptive Layout-Aware RAG v2。请基于现有实现继续优化，并保证现有功能不被破坏。
+
+当前已知状态：
+
+* `RAG_ADAPTIVE_ENABLED=True`
+* 配置希望使用：
+
+  * `VECTOR_BACKEND=chroma`
+  * `EMBEDDING_PROVIDER=local`
+* 但实际初始化结果是：
+
+  * `actual_backend='local_keyword'`
+* 说明 Chroma 或本地 embedding 初始化失败后已经 fallback 到 local keyword。
+* 查询分析目前是规则式：
+
+  * `RAG_QUERY_ANALYZER_USE_LLM=False`
+* 聊天检索入口大致在：
+
+  * `backend/app.py`
+  * `backend/adaptive_rag/adaptive_retriever.py`
+* 混合召回在：
+
+  * `backend/adaptive_rag/hybrid_retriever.py`
+* 重排在：
+
+  * `backend/adaptive_rag/reranker.py`
+* semantic chunk 构造在：
+
+  * `backend/semantic_chunker.py`
+* execution 展示在：
+
+  * `backend/harness/execution_builder.py`
+
+请按下面步骤工作。
+
+## 任务 1：本地代码搜查，不要先改代码
+
+请先用 `rg` / 全局搜索检查以下关键词，并整理代码路径、关键函数、当前行为：
+
+```bash
+rg -n "RAG_ADAPTIVE_ENABLED|VECTOR_BACKEND|EMBEDDING_PROVIDER|actual_backend|local_keyword|chroma|chromadb|embedding|sentence_transformers|adaptive_retrieve|retrieve_evidence|semantic_chunk|layout|table|figure|caption|page_lookup|table_lookup|figure_lookup|rule_weighted_v1|evidence_bundle|rag_pipeline" backend
+```
+
+请先输出一份诊断摘要，至少回答：
+
+1. Chroma 初始化在哪里发生？
+2. 为什么当前会 fallback 到 `local_keyword`？
+3. fallback 时有没有保存具体错误原因？
+4. embedding provider 的初始化路径是什么？
+5. adaptive retriever 实际支持哪些 retrieval mode？
+6. 每种 mode 的触发规则在哪里？
+7. table / figure / page evidence 是否真的能进入最终 prompt？
+8. abstract downweight 是否只影响 rerank，还是也影响最终 evidence bundle？
+9. execution 面板里现在是否能看到：
+
+   * query analysis
+   * selected retrieval mode
+   * actual backend
+   * fallback reason
+   * evidence type distribution
+   * reranker score breakdown
+
+如果这些信息没有完整展示，请记录为优化项。
+
+## 任务 2：优先修复 Chroma fallback 的可观测性
+
+不要一上来强行修 Chroma。先增强可观测性。
+
+请实现或补齐：
+
+1. 启动或首次检索时记录 vector backend 初始化结果：
+
+   * configured backend
+   * actual backend
+   * embedding provider
+   * embedding model
+   * chroma persist directory
+   * fallback reason
+   * exception class
+   * exception message
+2. 把这些信息写入 response.execution：
+
+   * `execution.rag_pipeline.backend_config`
+   * `execution.rag_pipeline.backend_status`
+3. 如果 Chroma 初始化失败，不要让任务失败，但 Assistant 的 execution 折叠面板要能看到：
+
+   * `configured_backend=chroma`
+   * `actual_backend=local_keyword`
+   * `fallback_reason=...`
+
+要求：不要在 trace 里保存 API key 或超长论文正文。
+
+## 任务 3：检查并修复 Chroma / local embedding 初始化问题
+
+在完成任务 2 后，再检查 Chroma 为什么没有起来。请优先检查：
+
+1. `requirements.txt` 是否包含：
+
+   * `chromadb`
+   * `sentence-transformers`
+   * `numpy`
+2. `backend/config.py` 或环境变量是否正确读取：
+
+   * `VECTOR_BACKEND`
+   * `EMBEDDING_PROVIDER`
+   * `EMBEDDING_MODEL`
+   * `VECTOR_DIR`
+3. Chroma persistent path 是否存在、是否可写。
+4. sentence-transformers 模型是否能本地加载。
+5. 如果模型下载失败，是否有明确 fallback。
+6. 如果当前环境不适合下载模型，请不要阻塞系统，而是保留 keyword fallback。
+
+请尽量做最小修改，使得：
+
+* Chroma 可用时使用 Chroma；
+* Chroma 不可用时自动 fallback；
+* fallback 原因清晰可见；
+* 不破坏当前 local_keyword 方案。
+
+## 任务 4：增强 adaptive retrieval 的 execution 展示
+
+请让每次聊天回答的 execution 中能看到 RAG 的关键决策：
+
+```json
+{
+  "query_analysis": {
+    "query_type": "...",
+    "is_complex": true,
+    "target_sections": ["method", "experiment"],
+    "needs_table": false,
+    "needs_figure": false,
+    "needs_page": false,
+    "scope": "paper_only"
+  },
+  "retrieval_plan": {
+    "mode": "complex_planned_retrieval",
+    "top_k": 14,
+    "reason": "question asks for method and experiment comparison"
+  },
+  "backend": {
+    "configured_backend": "chroma",
+    "actual_backend": "local_keyword",
+    "fallback_reason": "..."
+  },
+  "evidence_stats": {
+    "text_chunks": 8,
+    "section_summaries": 2,
+    "abstract_chunks": 1,
+    "tables": 1,
+    "figures": 0,
+    "pages": 0
+  }
+}
+```
+
+如果已有类似字段，请复用，不要重复造字段。
+
+## 任务 5：优化 reranker，但不要改成 LLM rerank
+
+当前 reranker 是 `rule_weighted_v1`。请保持规则式，不要引入 LLM rerank。请做以下优化：
+
+1. 给 reranker 增加 score breakdown，方便调试：
+
+   * base score
+   * lexical hit score
+   * section bonus
+   * table bonus
+   * figure bonus
+   * page bonus
+   * abstract penalty
+   * final score
+2. 对不同 query type 采用不同权重：
+
+   * 方法类问题：method / approach / model section bonus 更高；
+   * 实验类问题：experiment / result / evaluation section bonus 更高；
+   * 表格类问题：table evidence bonus 更高；
+   * 图示类问题：figure / caption evidence bonus 更高；
+   * 综述类问题：section_summary 和 conclusion 可提高，但 abstract 仍不能替代正文证据。
+3. 保持 abstract downweight 策略：
+
+   * abstract 可以作为 high-level clue；
+   * abstract 不应挤掉 method / experiment / result 的正文 evidence。
+
+请给出修改后的权重规则，并在 execution 中能看到每条 evidence 的 score breakdown。
+
+## 任务 6：补一个最小 RAG 评估 harness
+
+请新增一个最小评估脚本，不要做复杂平台。
+
+建议路径：
+
+```text
+backend/eval/rag_eval.py
+backend/eval/rag_eval_set.example.jsonl
+```
+
+`rag_eval_set.example.jsonl` 格式建议：
+
+```json
+{"id":"q001","scope":"paper_only","paper_id":"...","query":"这篇论文的方法是什么？","gold_sections":["method"],"gold_keywords":["method","model","approach"]}
+{"id":"q002","scope":"paper_only","paper_id":"...","query":"实验结果怎么样？","gold_sections":["experiment","result"],"gold_keywords":["experiment","accuracy","result"]}
+{"id":"q003","scope":"paper_only","paper_id":"...","query":"表2说明了什么？","gold_evidence_types":["table"],"gold_keywords":["Table 2","baseline","accuracy"]}
+```
+
+评估脚本先实现最小指标：
+
+1. `section_hit@k`
+2. `keyword_hit@k`
+3. `evidence_type_hit@k`
+4. `retrieved_count`
+5. `actual_backend`
+6. `selected_mode`
+
+运行方式建议：
+
+```bash
+python -m backend.eval.rag_eval --eval-file backend/eval/rag_eval_set.example.jsonl --top-k 10
+```
+
+输出 JSON 或 Markdown 报告均可。
+
+注意：如果 eval set 中的 `paper_id` 不存在，要跳过并提示，不要报错退出。
+
+## 任务 7：加最小测试
+
+请检查现有 tests 结构。如果已有 pytest，请补充最小测试：
+
+1. adaptive retriever 在简单问题下选择 `simple_retrieve_rerank`；
+2. 方法/实验/对比类问题选择复杂检索；
+3. 表格问题选择 `table_lookup`；
+4. 图片/图问题选择 `figure_lookup`；
+5. Chroma 不可用时 fallback 到 `local_keyword` 且 execution 中有 fallback reason；
+6. reranker 对 target section 有 bonus；
+7. abstract 不应在复杂问题中过度压过正文 evidence。
+
+运行：
+
+```bash
+python -m pytest backend/tests -q
+```
+
+如果测试环境缺依赖，请不要强制安装大依赖，先让测试能在 local_keyword fallback 下通过。
+
+## 输出要求
+
+请最终输出：
+
+1. 本地搜查摘要；
+2. 修改文件列表；
+3. 每个修改的原因；
+4. 是否修复了 Chroma fallback；
+5. 如果没有修复，具体原因是什么；
+6. 新增或修改的 execution 字段；
+7. 新增的 eval harness 使用方式；
+8. 测试结果。
+
+请遵守：
+
+* 不要删除现有功能；
+* 不要把 adaptive RAG 改回 naive RAG；
+* 不要移除 local_keyword fallback；
+* 不要引入多页面 UI；
+* 不要改动与 RAG 无关的大量代码；
+* 不要把 API key、完整 PDF 正文、超长 prompt 写入 trace；
+* 优先小步修改，保证项目能运行。

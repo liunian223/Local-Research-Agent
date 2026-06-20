@@ -109,8 +109,20 @@
 </template>
 
 <script setup lang="ts">
-import axios from "axios";
-import { onMounted, ref } from "vue";
+import { onMounted, ref, shallowRef } from "vue";
+import {
+  apiMessage,
+  createChatSession,
+  deleteChatSessionById,
+  deletePaperById,
+  getChatHistory,
+  listChatSessions,
+  listFolders,
+  listPapers,
+  searchPapersByKeyword,
+  sendChatMessage,
+  uploadChatPdf
+} from "../api/researchAgent";
 import ExecutionPanel from "../components/ExecutionPanel.vue";
 import type { ChatMessage, ChatSession, Folder, Paper } from "../types";
 
@@ -119,7 +131,7 @@ const readyMessage = "系统已就绪。请上传 PDF，或选择论文后提问
 const folders = ref<Folder[]>([]);
 const papers = ref<Paper[]>([]);
 const sessions = ref<ChatSession[]>([]);
-const messages = ref<ChatMessage[]>([{ role: "assistant", text: readyMessage }]);
+const messages = shallowRef<ChatMessage[]>([{ role: "assistant", text: readyMessage }]);
 const keyword = ref("");
 const currentFolderId = ref("folder_all");
 const currentSessionId = ref("session_default");
@@ -143,61 +155,58 @@ function sessionTitle(session: ChatSession): string {
   return session.display_title || session.title || "新对话";
 }
 
-function apiMessage(err: unknown): string {
-  if (axios.isAxiosError(err)) {
-    return err.response?.data?.detail?.error?.message || err.response?.data?.detail || err.message;
-  }
-  return String(err);
+function appendMessage(message: ChatMessage): void {
+  messages.value = [...messages.value, message];
 }
 
 async function loadFolders() {
-  const response = await axios.get("/api/folders");
-  folders.value = response.data.folders;
+  const response = await listFolders();
+  folders.value = response.folders;
 }
 
 async function loadPapers() {
-  const response = await axios.get("/api/papers", { params: { folder_id: currentFolderId.value } });
-  papers.value = response.data.papers;
+  const response = await listPapers(currentFolderId.value);
+  papers.value = response.papers;
 }
 
 async function loadSessions() {
-  const response = await axios.get("/api/chat/sessions");
-  sessions.value = response.data.sessions;
+  const response = await listChatSessions();
+  sessions.value = response.sessions;
   if (!sessions.value.some((session) => session.id === currentSessionId.value) && sessions.value.length) {
     currentSessionId.value = sessions.value[0].id;
   }
 }
 
 async function loadChatHistory() {
-  const response = await axios.get("/api/chat/history", { params: { session_id: currentSessionId.value } });
-  currentSessionId.value = response.data.session_id || currentSessionId.value;
-  if (response.data.messages?.length) {
-    messages.value = response.data.messages;
+  const response = await getChatHistory(currentSessionId.value);
+  currentSessionId.value = response.session_id || currentSessionId.value;
+  if (response.messages?.length) {
+    messages.value = response.messages;
   } else {
     messages.value = [{ role: "assistant", text: readyMessage }];
   }
-  if (response.data.current_folder_id) {
-    currentFolderId.value = response.data.current_folder_id;
+  if (response.current_folder_id) {
+    currentFolderId.value = response.current_folder_id;
   }
-  if (response.data.chat_scope) {
-    chatScope.value = response.data.chat_scope;
+  if (response.chat_scope) {
+    chatScope.value = response.chat_scope;
   }
-  if (response.data.current_paper) {
-    currentPaper.value = response.data.current_paper;
+  if (response.current_paper) {
+    currentPaper.value = response.current_paper;
   }
 }
 
 async function createSession() {
-  const response = await axios.post("/api/chat/sessions", { title: "新对话" });
+  const response = await createChatSession("新对话");
   await loadSessions();
-  await selectSession(response.data.session.id);
+  await selectSession(response.session.id);
 }
 
 async function deleteSession(session: ChatSession) {
   try {
-    const response = await axios.delete(`/api/chat/sessions/${session.id}`);
+    const response = await deleteChatSessionById(session.id);
     await loadSessions();
-    await selectSession(response.data.next_session_id || sessions.value[0]?.id || "session_default");
+    await selectSession(response.next_session_id || sessions.value[0]?.id || "session_default");
   } catch (err) {
     error.value = apiMessage(err);
   }
@@ -216,7 +225,7 @@ async function selectSession(id: string) {
 
 async function deletePaper(paper: Paper) {
   try {
-    await axios.delete(`/api/papers/${paper.id}`);
+    await deletePaperById(paper.id);
     if (currentPaper.value?.id === paper.id) {
       currentPaper.value = null;
     }
@@ -237,8 +246,8 @@ async function searchPapers() {
     await loadPapers();
     return;
   }
-  const response = await axios.get("/api/papers/search", { params: { keyword: keyword.value, folder_id: currentFolderId.value } });
-  papers.value = response.data.papers;
+  const response = await searchPapersByKeyword(keyword.value, currentFolderId.value);
+  papers.value = response.papers;
 }
 
 function selectPaper(paper: Paper) {
@@ -248,22 +257,18 @@ function selectPaper(paper: Paper) {
 async function uploadFile(file: File) {
   busy.value = true;
   error.value = "";
-  messages.value.push({ role: "user", text: `上传 PDF：${file.name}` });
+  appendMessage({ role: "user", text: `上传 PDF：${file.name}` });
   try {
-    const form = new FormData();
-    form.append("file", file);
-    form.append("current_folder_id", currentFolderId.value);
-    form.append("session_id", currentSessionId.value);
-    form.append("message", draft.value);
-    const response = await axios.post("/api/chat/upload", form, { headers: { "Content-Type": "multipart/form-data" } });
-    messages.value.push({ role: "assistant", text: response.data.answer, execution: response.data.execution });
+    const response = await uploadChatPdf(file, currentFolderId.value, currentSessionId.value, draft.value);
+    const assistantMessage: ChatMessage = { role: "assistant", text: response.answer, execution: response.execution };
+    appendMessage(assistantMessage);
     await loadPapers();
-    const paper = papers.value.find((item) => item.id === response.data.current_paper?.paper_id);
+    const paper = papers.value.find((item) => item.id === response.current_paper?.paper_id);
     if (paper) currentPaper.value = paper;
     await loadSessions();
   } catch (err) {
     error.value = apiMessage(err);
-    messages.value.push({ role: "assistant", text: error.value });
+    appendMessage({ role: "assistant", text: error.value });
   } finally {
     dragging.value = false;
     busy.value = false;
@@ -288,16 +293,17 @@ async function sendMessage() {
   busy.value = true;
   error.value = "";
   draft.value = "";
-  messages.value.push({ role: "user", text });
+  appendMessage({ role: "user", text });
   try {
-    const response = await axios.post("/api/chat/message", {
+    const response = await sendChatMessage({
       message: text,
       current_paper_id: currentPaper.value?.id || null,
       current_folder_id: currentFolderId.value,
       session_id: currentSessionId.value,
       chat_scope: chatScope.value
     });
-    messages.value.push({ role: "assistant", text: response.data.answer, execution: response.data.execution });
+    const assistantMessage: ChatMessage = { role: "assistant", text: response.answer, execution: response.execution };
+    appendMessage(assistantMessage);
     await loadPapers();
     if (currentPaper.value) {
       const refreshed = papers.value.find((paper) => paper.id === currentPaper.value?.id);
@@ -306,7 +312,7 @@ async function sendMessage() {
     await loadSessions();
   } catch (err) {
     error.value = apiMessage(err);
-    messages.value.push({ role: "assistant", text: error.value });
+    appendMessage({ role: "assistant", text: error.value });
   } finally {
     busy.value = false;
   }

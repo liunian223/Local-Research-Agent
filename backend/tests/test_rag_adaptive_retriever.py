@@ -5,7 +5,8 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app import app
-from database import connect
+from adaptive_rag.adaptive_retriever import adaptive_retrieve
+from database import connect, init_db
 from tests.test_acceptance import make_multipage_pdf, post_pdf
 
 
@@ -89,3 +90,19 @@ def test_abstract_chunks_are_persisted_separately(tmp_path: Path) -> None:
         assert abstract_chunk is not None
         assert body_chunk is not None
         assert "Keywords" not in abstract_chunk["content"]
+
+
+def test_adaptive_retriever_selects_expected_modes_without_evidence() -> None:
+    init_db()
+    with connect() as conn:
+        _, simple_meta = adaptive_retrieve(conn, "paper_only", None, "What is the title?", 10)
+        _, complex_meta = adaptive_retrieve(conn, "paper_only", None, "Compare the method and experiment results", 10)
+        _, table_meta = adaptive_retrieve(conn, "paper_only", None, "What does Table 2 show?", 10)
+        _, figure_meta = adaptive_retrieve(conn, "paper_only", None, "Explain Figure 1", 10)
+
+    assert simple_meta["retrieval_mode"] == "simple_retrieve_rerank"
+    assert complex_meta["retrieval_mode"] == "complex_planned_retrieval"
+    assert table_meta["retrieval_mode"] == "table_lookup"
+    assert figure_meta["retrieval_mode"] == "figure_lookup"
+    assert table_meta["query_analysis"]["needs_table"] is True
+    assert figure_meta["query_analysis"]["needs_figure"] is True

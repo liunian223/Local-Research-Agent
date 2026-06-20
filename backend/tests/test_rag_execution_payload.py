@@ -32,5 +32,12 @@ def test_execution_payload_contains_adaptive_rag_fields(tmp_path: Path) -> None:
         assert execution["retrieval"]["abstract_control"]
         assert execution["retrieval"]["rerank"]
         assert execution["retrieval"]["coverage_check"]
+        assert execution["retrieval"]["backend_diagnostics"]
+        assert "fallback_reason" in execution["retrieval"]
+        assert execution["retrieval"]["evidence_stats"]
+        assert execution["rag_pipeline"]["backend_config"]
+        assert execution["rag_pipeline"]["backend_status"]
+        if execution["rag_evidence"]:
+            assert "score_breakdown" in execution["rag_evidence"][0]
         assert "abstract_chunks" in execution["evidence_bundle"]
         assert isinstance(execution["rag_evidence"], list)

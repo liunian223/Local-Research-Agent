@@ -96,6 +96,9 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_chunks_page ON paper_chunks(page_start, page_end)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_source_type ON document_chunks(source_type)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_page ON document_chunks(page_start, page_end)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_image_assets_paper_id ON image_assets(paper_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_image_assets_page ON image_assets(paper_id, page_no)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_image_assets_source ON image_assets(source_type)")
         existing = conn.execute("SELECT id FROM folders WHERE id = ?", ("folder_all",)).fetchone()
         if not existing:
             conn.execute(

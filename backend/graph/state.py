@@ -40,6 +40,14 @@ class AgentState(TypedDict, total=False):
     rag_pipeline: dict[str, Any]
     evidence_bundle: dict[str, Any]
 
+    image_assets: list[dict[str, Any]]
+    selected_image_paths: list[str]
+    rendered_image_paths: list[str]
+    vision_required: bool
+    vision_answer: str
+    vision_execution: dict[str, Any]
+    pdf_image_extraction: dict[str, Any]
+
     is_long_paper: bool
     section_summaries: dict[str, Any]
     note_plan: dict[str, Any]
@@ -69,6 +77,7 @@ class AgentState(TypedDict, total=False):
     fallbacks: list[Any]
 
     status: str
+    task_status: str
     error: Optional[str]
 
     harness: dict[str, Any]

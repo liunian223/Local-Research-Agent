@@ -18,6 +18,7 @@ PHASES = {
     "NOTE_READY",
     "ANSWER_CHAT",
     "ANSWER_READY",
+    "VISION_CHAT",
     "FINISH",
     "ERROR",
 }
@@ -28,6 +29,7 @@ TASK_INITIAL_PHASE = {
     "generate_note": "REQUEST_EVIDENCE",
     "paper_chat": "REQUEST_EVIDENCE",
     "global_chat": "REQUEST_EVIDENCE",
+    "vision_chat": "REQUEST_EVIDENCE",
 }
 
 NODE_LIMITS = {
@@ -62,6 +64,13 @@ def standard_flow(task_type: str) -> list[dict[str, str]]:
             {"node": "coordinator_node", "phase": "REQUEST_EVIDENCE"},
             {"node": "knowledge_rag_agent_node", "phase": "EVIDENCE_READY"},
             {"node": "note_skill_agent_node", "phase": "NOTE_READY"},
+            {"node": "finish_node", "phase": "FINISH"},
+        ]
+    if task_type == "vision_chat":
+        return [
+            {"node": "coordinator_node", "phase": "REQUEST_EVIDENCE"},
+            {"node": "knowledge_rag_agent_node", "phase": "EVIDENCE_READY"},
+            {"node": "note_skill_agent_node", "phase": "ANSWER_READY"},
             {"node": "finish_node", "phase": "FINISH"},
         ]
     return [

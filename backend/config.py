@@ -15,12 +15,26 @@ ENV_NAME = os.getenv("LOCAL_RESEARCH_AGENT_ENV", "development")
 # normal runs. Tests set environment values directly and should keep priority.
 load_dotenv(BACKEND_DIR / ".env", override=ENV_NAME != "test")
 
-TEXT_MODEL_PROVIDER = os.getenv("TEXT_MODEL_PROVIDER", "openai")
-VISION_MODEL_PROVIDER = os.getenv("VISION_MODEL_PROVIDER", "openai")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "codex")
+DISABLE_OPENAI_API = os.getenv("DISABLE_OPENAI_API", "true").lower() == "true"
+TEXT_MODEL_PROVIDER = os.getenv("TEXT_MODEL_PROVIDER", LLM_PROVIDER)
+VISION_MODEL_PROVIDER = os.getenv("VISION_MODEL_PROVIDER", LLM_PROVIDER)
+if DISABLE_OPENAI_API:
+    if LLM_PROVIDER.lower() in {"codex", "codex_cli", "codex_runtime"} and TEXT_MODEL_PROVIDER.lower() == "openai":
+        TEXT_MODEL_PROVIDER = LLM_PROVIDER
+    if LLM_PROVIDER.lower() in {"codex", "codex_cli", "codex_runtime"} and VISION_MODEL_PROVIDER.lower() == "openai":
+        VISION_MODEL_PROVIDER = LLM_PROVIDER
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")
 CODEX_CLI_COMMAND = os.getenv("CODEX_CLI_COMMAND", "codex")
-CODEX_CLI_MODEL = os.getenv("CODEX_CLI_MODEL", "")
-CODEX_CLI_TIMEOUT_SECONDS = int(os.getenv("CODEX_CLI_TIMEOUT_SECONDS", "180"))
+CODEX_MODEL_TEXT = os.getenv("CODEX_MODEL_TEXT", os.getenv("CODEX_CLI_MODEL", ""))
+CODEX_MODEL_VISION = os.getenv("CODEX_MODEL_VISION", CODEX_MODEL_TEXT)
+CODEX_SANDBOX = os.getenv("CODEX_SANDBOX", "read_only")
+CODEX_TIMEOUT_SECONDS = int(os.getenv("CODEX_TIMEOUT_SECONDS", os.getenv("CODEX_CLI_TIMEOUT_SECONDS", "180")))
+CODEX_MAX_CONCURRENCY = int(os.getenv("CODEX_MAX_CONCURRENCY", "1"))
+CODEX_PROBE_TIMEOUT_SECONDS = int(os.getenv("CODEX_PROBE_TIMEOUT_SECONDS", "45"))
+CODEX_PROBE_MODEL = os.getenv("CODEX_PROBE_MODEL", "")
+CODEX_CLI_MODEL = CODEX_MODEL_TEXT
+CODEX_CLI_TIMEOUT_SECONDS = CODEX_TIMEOUT_SECONDS
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -32,7 +46,7 @@ OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-s
 OPENAI_EMBEDDING_DIMENSIONS = int(os.getenv("OPENAI_EMBEDDING_DIMENSIONS", "1536"))
 OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "90"))
 OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
-ENABLE_OPENAI_VISION = os.getenv("ENABLE_OPENAI_VISION", "true").lower() == "true"
+ENABLE_OPENAI_VISION = os.getenv("ENABLE_OPENAI_VISION", "true").lower() == "true" and not DISABLE_OPENAI_API
 MAX_OPENAI_IMAGE_MB = int(os.getenv("MAX_OPENAI_IMAGE_MB", "10"))
 OPENAI_STORE_RESPONSES = os.getenv("OPENAI_STORE_RESPONSES", "false").lower() == "true"
 
@@ -53,6 +67,9 @@ DATA_DIR = Path(os.getenv("DATA_DIR", ROOT_DIR / "data"))
 PAPER_DIR = Path(os.getenv("PAPER_DIR", DATA_DIR / "papers"))
 PARSED_DIR = Path(os.getenv("PARSED_DIR", DATA_DIR / "parsed"))
 VECTOR_DIR = Path(os.getenv("VECTOR_DIR", DATA_DIR / "vector_store"))
+VISION_DIR = Path(os.getenv("VISION_DIR", DATA_DIR / "vision"))
+PDF_IMAGE_DIR = Path(os.getenv("PDF_IMAGE_DIR", VISION_DIR / "pdf_images"))
+PDF_RENDERED_PAGE_DIR = Path(os.getenv("PDF_RENDERED_PAGE_DIR", VISION_DIR / "rendered_pages"))
 OBSIDIAN_VAULT_PATH = Path(os.getenv("OBSIDIAN_VAULT_PATH", ROOT_DIR / "obsidian_vault"))
 OBSIDIAN_NOTE_DIR = os.getenv("OBSIDIAN_NOTE_DIR", "02_ReadingNotes")
 OBSIDIAN_ATTACHMENT_DIR = os.getenv("OBSIDIAN_ATTACHMENT_DIR", "attachments/papers")
@@ -77,6 +94,13 @@ MAX_EVIDENCE_ITEMS = int(os.getenv("MAX_EVIDENCE_ITEMS", "20"))
 MAX_EVIDENCE_CHARS = int(os.getenv("MAX_EVIDENCE_CHARS", "1200"))
 MAX_NOTE_REPAIR_ROUNDS = int(os.getenv("MAX_NOTE_REPAIR_ROUNDS", "2"))
 MAX_NOTE_IMAGE_ATTACHMENTS = int(os.getenv("MAX_NOTE_IMAGE_ATTACHMENTS", "6"))
+PDF_IMAGE_EXTRACT_ENABLED = os.getenv("PDF_IMAGE_EXTRACT_ENABLED", "true").lower() == "true"
+PDF_PAGE_RENDER_ENABLED = os.getenv("PDF_PAGE_RENDER_ENABLED", "true").lower() == "true"
+PDF_IMAGE_MIN_WIDTH = int(os.getenv("PDF_IMAGE_MIN_WIDTH", "120"))
+PDF_IMAGE_MIN_HEIGHT = int(os.getenv("PDF_IMAGE_MIN_HEIGHT", "120"))
+PDF_RENDER_DPI = int(os.getenv("PDF_RENDER_DPI", "160"))
+MAX_PDF_IMAGES_PER_PAPER = int(os.getenv("MAX_PDF_IMAGES_PER_PAPER", "40"))
+MAX_VISION_IMAGES_PER_CALL = int(os.getenv("MAX_VISION_IMAGES_PER_CALL", "4"))
 
 LAYOUT_RAG_PARSER_VERSION = os.getenv("LAYOUT_RAG_PARSER_VERSION", "layout-rag-v1")
 SEMANTIC_CHUNK_MAX_CHARS = int(os.getenv("SEMANTIC_CHUNK_MAX_CHARS", "1800"))
@@ -102,5 +126,14 @@ ENABLE_OCR_FALLBACK = os.getenv("ENABLE_OCR_FALLBACK", "false").lower() == "true
 
 
 def ensure_directories() -> None:
-    for path in [DATA_DIR, PAPER_DIR, PARSED_DIR, VECTOR_DIR, OBSIDIAN_VAULT_PATH / OBSIDIAN_NOTE_DIR]:
+    for path in [
+        DATA_DIR,
+        PAPER_DIR,
+        PARSED_DIR,
+        VECTOR_DIR,
+        VISION_DIR,
+        PDF_IMAGE_DIR,
+        PDF_RENDERED_PAGE_DIR,
+        OBSIDIAN_VAULT_PATH / OBSIDIAN_NOTE_DIR,
+    ]:
         path.mkdir(parents=True, exist_ok=True)

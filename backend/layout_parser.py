@@ -475,7 +475,17 @@ def _is_section_heading(text: str) -> bool:
         return False
     if any(pattern.search(clean) for _, pattern in SECTION_PATTERNS):
         return True
-    return bool(re.match(r"^\d+(\.\d+)*\.?\s+[A-Z][A-Za-z0-9 ,:()/-]{2,120}$", clean))
+    numbered = re.match(r"^\d+(\.\d+)*\.?\s+([A-Z][A-Za-z0-9 ,:()/-]{2,120})$", clean)
+    if not numbered:
+        return False
+    title = numbered.group(2).strip()
+    words = re.findall(r"[A-Za-z0-9]+", title)
+    if len(words) > 10 or title.endswith("."):
+        return False
+    sentence_markers = {"given", "that", "our", "we", "this", "these", "those", "takes", "take", "into", "account", "is", "are", "was", "were", "has", "have"}
+    if len(words) > 5 and any(word.lower() in sentence_markers for word in words):
+        return False
+    return True
 
 
 def normalize_section_name(title: str) -> str:

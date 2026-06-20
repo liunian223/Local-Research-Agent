@@ -88,6 +88,11 @@ export interface RetrievalSummary {
   retrieval_mode?: string;
   legacy_mode?: string;
   backend?: string;
+  backend_diagnostics?: JsonObject;
+  backend_status?: JsonObject;
+  backend_config?: JsonObject;
+  fallback_reason?: string;
+  evidence_stats?: JsonObject;
   fallback?: boolean;
   query_analysis?: JsonObject;
   abstract_control?: JsonObject;
@@ -136,5 +141,7 @@ export interface ExecutionPayload {
   rag_pipeline?: JsonValue;
   retrieval?: RetrievalSummary;
   note_generation?: NoteGenerationSummary;
+  vision_execution?: JsonObject;
+  pdf_image_extraction?: JsonObject;
   fallbacks?: JsonValue[];
 }

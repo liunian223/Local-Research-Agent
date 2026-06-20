@@ -44,6 +44,8 @@ def build_task_execution(
     retrieval: dict[str, Any] | None = None,
     paper_id: str | None = None,
     note_generation: dict[str, Any] | None = None,
+    vision_execution: dict[str, Any] | None = None,
+    pdf_image_extraction: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     traces = rows_to_dicts(conn.execute("SELECT * FROM agent_traces WHERE task_id = ? ORDER BY step_index ASC", (task_id,)).fetchall())
     mcp = rows_to_dicts(conn.execute("SELECT * FROM mcp_tool_calls WHERE task_id = ? ORDER BY created_at ASC", (task_id,)).fetchall())
@@ -71,6 +73,8 @@ def build_task_execution(
         "rag_pipeline": rag_pipeline_summary(conn, paper_id or task.get("current_paper_id")),
         "retrieval": retrieval_meta,
         "note_generation": note_generation or {},
+        "vision_execution": vision_execution or {},
+        "pdf_image_extraction": pdf_image_extraction or {},
         "fallbacks": fallbacks,
     }
 
