@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 from database import now_iso, row_to_dict, rows_to_dicts
@@ -18,6 +19,7 @@ def build_harness_execution(
     policy_checks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     summary = summarize_tool_calls(mcp_calls)
+    latency_ms = max(summary.get("total_latency_ms", 0), task_duration_ms(task))
     return {
         "task_id": task.get("id"),
         "run_id": task.get("run_id") or f"run_{task.get('id', '')}",
@@ -31,7 +33,7 @@ def build_harness_execution(
         "tool_summary": summary,
         "redaction": redaction_summary(),
         "fallbacks": fallbacks,
-        "latency_ms": summary.get("total_latency_ms", 0),
+        "latency_ms": latency_ms,
     }
 
 
@@ -54,6 +56,7 @@ def build_task_execution(
     visited = [trace["node_name"] for trace in traces]
     visits_ok, visits_error = validate_node_visits(visited)
     retrieval_meta = retrieval or {}
+    evidence_bundle = retrieval_meta.get("final_note_evidence_bundle") or build_evidence_bundle(evidence, retrieval_meta)
     return {
         "harness": build_harness_execution(task, mcp, fallbacks),
         "graph_state": {
@@ -69,7 +72,7 @@ def build_task_execution(
         "skill_phases": skill_phases,
         "model_execution": get_model_gateway().model_execution_info(),
         "rag_evidence": evidence,
-        "evidence_bundle": build_evidence_bundle(evidence, retrieval_meta),
+        "evidence_bundle": evidence_bundle,
         "rag_pipeline": rag_pipeline_summary(conn, paper_id or task.get("current_paper_id")),
         "retrieval": retrieval_meta,
         "note_generation": note_generation or {},
@@ -103,6 +106,15 @@ def summarize_tool_calls(mcp_calls: list[dict[str, Any]]) -> dict[str, Any]:
         "calls_by_server": by_server,
         "total_latency_ms": latency,
     }
+
+
+def task_duration_ms(task: dict[str, Any]) -> int:
+    try:
+        created = datetime.fromisoformat(str(task.get("created_at") or ""))
+        updated = datetime.fromisoformat(str(task.get("updated_at") or ""))
+    except Exception:
+        return 0
+    return max(0, int((updated - created).total_seconds() * 1000))
 
 
 def policy_checks_from_mcp(mcp_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:

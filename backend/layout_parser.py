@@ -25,6 +25,61 @@ SECTION_PATTERNS = [
     ("appendix", re.compile(r"^(appendix|附录)\b", re.I)),
 ]
 
+ENGLISH_SECTION_TITLES = {
+    "abstract": "abstract",
+    "introduction": "introduction",
+    "related work": "related_work",
+    "method": "method",
+    "methods": "method",
+    "methodology": "method",
+    "materials and methods": "method",
+    "approach": "method",
+    "experiment": "experiment",
+    "experiments": "experiment",
+    "experimental setup": "experiment",
+    "evaluation": "experiment",
+    "results": "result",
+    "result": "result",
+    "discussion": "discussion",
+    "conclusion": "conclusion",
+    "conclusions": "conclusion",
+    "references": "references",
+}
+
+SECTION_SENTENCE_MARKERS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "be",
+    "by",
+    "can",
+    "for",
+    "from",
+    "given",
+    "has",
+    "have",
+    "highlight",
+    "highlights",
+    "in",
+    "into",
+    "is",
+    "of",
+    "our",
+    "show",
+    "shows",
+    "takes",
+    "that",
+    "the",
+    "these",
+    "this",
+    "to",
+    "we",
+    "were",
+    "with",
+}
+
 CAPTION_RE = re.compile(r"^(table|fig\.?|figure|表|图)\s*[\dIVXivx一二三四五六七八九十]+[.:：\s-]", re.I)
 TABLE_RE = re.compile(r"^(table|表)\s*[\dIVXivx一二三四五六七八九十]+", re.I)
 FIGURE_RE = re.compile(r"^(fig\.?|figure|图)\s*[\dIVXivx一二三四五六七八九十]+", re.I)
@@ -43,7 +98,7 @@ def parse_pdf_layout(path: Path, paper: dict[str, Any], parsed_text: str = "") -
         pages, blocks = _fallback_pages_and_blocks(parsed_text, paper["id"])
 
     _assign_header_footer(pages, blocks)
-    sections = _detect_sections(paper["id"], blocks)
+    sections = _detect_sections(paper["id"], blocks, pages)
     _assign_sections_to_blocks(blocks, sections)
     abstract_detection = None
     if config.RAG_ABSTRACT_DETECTION_ENABLED:
@@ -116,46 +171,102 @@ def _extract_pages_and_blocks(doc: Any, paper_id: str) -> tuple[list[dict[str, A
     for page_index, page in enumerate(doc, start=1):
         rect = page.rect
         page_blocks: list[str] = []
-        raw_blocks = page.get_text("blocks", sort=True) or []
+        page_info = {
+            "page_id": f"{paper_id}_page_{page_index:03d}",
+            "paper_id": paper_id,
+            "page_number": page_index,
+            "width": float(rect.width),
+            "height": float(rect.height),
+            "header_text": "",
+            "footer_text": "",
+            "main_text": "",
+            "block_ids": page_blocks,
+            "table_ids": [],
+            "figure_ids": [],
+        }
+        raw_blocks = _extract_page_text_blocks(page)
         for raw in raw_blocks:
-            if len(raw) < 5:
-                continue
-            text = re.sub(r"\s+\n", "\n", str(raw[4] or "")).strip()
+            text = re.sub(r"\s+\n", "\n", str(raw.get("text") or "")).strip()
             if not text:
                 continue
             block_id = f"{paper_id}_block_{len(blocks) + 1:04d}"
-            block_type = _classify_block(text)
             block = {
                 "block_id": block_id,
                 "paper_id": paper_id,
                 "page_number": page_index,
-                "block_type": block_type,
+                "block_type": "text",
                 "text": text,
-                "bbox": [float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3])],
+                "bbox": raw.get("bbox") or [0, 0, 0, 0],
+                "font_size": raw.get("font_size", 0),
+                "max_font_size": raw.get("max_font_size", 0),
+                "avg_font_size": raw.get("avg_font_size", 0),
+                "bold": bool(raw.get("bold")),
+                "uppercase_ratio": raw.get("uppercase_ratio", 0),
                 "section_id": "",
                 "reading_order": order,
                 "is_header": False,
                 "is_footer": False,
             }
+            block["block_type"] = _classify_block(text, block, page_info)
             blocks.append(block)
             page_blocks.append(block_id)
             order += 1
-        pages.append(
-            {
-                "page_id": f"{paper_id}_page_{page_index:03d}",
-                "paper_id": paper_id,
-                "page_number": page_index,
-                "width": float(rect.width),
-                "height": float(rect.height),
-                "header_text": "",
-                "footer_text": "",
-                "main_text": "",
-                "block_ids": page_blocks,
-                "table_ids": [],
-                "figure_ids": [],
-            }
-        )
+        pages.append(page_info)
     return pages, blocks
+
+
+def _extract_page_text_blocks(page: Any) -> list[dict[str, Any]]:
+    try:
+        data = page.get_text("dict", sort=True) or {}
+        blocks = []
+        for raw_block in data.get("blocks") or []:
+            if raw_block.get("type") not in {0, None}:
+                continue
+            lines = raw_block.get("lines") or []
+            text_lines: list[str] = []
+            sizes: list[float] = []
+            fonts: list[str] = []
+            for line in lines:
+                spans = [span for span in line.get("spans") or [] if str(span.get("text") or "").strip()]
+                if not spans:
+                    continue
+                text_lines.append("".join(str(span.get("text") or "") for span in spans).strip())
+                for span in spans:
+                    sizes.append(float(span.get("size") or 0))
+                    fonts.append(str(span.get("font") or ""))
+            text = "\n".join(line for line in text_lines if line).strip()
+            if not text:
+                continue
+            letters = re.findall(r"[A-Za-z]", text)
+            uppercase = sum(1 for letter in letters if letter.isupper())
+            blocks.append(
+                {
+                    "text": text,
+                    "bbox": [float(value) for value in raw_block.get("bbox", [0, 0, 0, 0])],
+                    "font_size": max(sizes) if sizes else 0,
+                    "max_font_size": max(sizes) if sizes else 0,
+                    "avg_font_size": sum(sizes) / len(sizes) if sizes else 0,
+                    "bold": any("bold" in font.lower() for font in fonts),
+                    "uppercase_ratio": uppercase / len(letters) if letters else 0,
+                }
+            )
+        if blocks:
+            return blocks
+    except Exception:
+        pass
+    return [
+        {
+            "text": str(raw[4] or ""),
+            "bbox": [float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3])],
+            "font_size": 0,
+            "max_font_size": 0,
+            "avg_font_size": 0,
+            "bold": False,
+            "uppercase_ratio": 0,
+        }
+        for raw in (page.get_text("blocks", sort=True) or [])
+        if len(raw) >= 5
+    ]
 
 
 def _fallback_pages_and_blocks(text: str, paper_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -163,9 +274,14 @@ def _fallback_pages_and_blocks(text: str, paper_id: str) -> tuple[list[dict[str,
         "block_id": f"{paper_id}_block_0001",
         "paper_id": paper_id,
         "page_number": 1,
-        "block_type": "text",
+        "block_type": "title" if _is_section_heading(text.splitlines()[0] if text else "") else "text",
         "text": text,
         "bbox": [0, 0, 0, 0],
+        "font_size": 0,
+        "max_font_size": 0,
+        "avg_font_size": 0,
+        "bold": False,
+        "uppercase_ratio": 0,
         "section_id": "",
         "reading_order": 0,
         "is_header": False,
@@ -187,11 +303,11 @@ def _fallback_pages_and_blocks(text: str, paper_id: str) -> tuple[list[dict[str,
     return [page], [block] if text else []
 
 
-def _classify_block(text: str) -> str:
+def _classify_block(text: str, block: dict[str, Any] | None = None, page: dict[str, Any] | None = None) -> str:
     first = text.splitlines()[0].strip()
     if any(CAPTION_RE.search(line.strip()) for line in text.splitlines()):
         return "caption"
-    if _is_section_heading(first):
+    if _is_section_heading(first, block, page):
         return "title"
     if re.match(r"^[-*•]\s+", first):
         return "list"
@@ -221,13 +337,14 @@ def _assign_header_footer(pages: list[dict[str, Any]], blocks: list[dict[str, An
                 page["main_text"] = _join_text(page.get("main_text", ""), text)
 
 
-def _detect_sections(paper_id: str, blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _detect_sections(paper_id: str, blocks: list[dict[str, Any]], pages: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     sections: list[dict[str, Any]] = []
+    page_by_number = {page.get("page_number"): page for page in pages or []}
     for block in blocks:
         if block.get("is_header") or block.get("is_footer"):
             continue
         first = (block.get("text") or "").splitlines()[0].strip()
-        if not _is_section_heading(first):
+        if not _is_section_heading(first, block, page_by_number.get(block.get("page_number"))):
             continue
         normalized = normalize_section_name(first)
         section_id = f"{paper_id}_sec_{len(sections) + 1:03d}"
@@ -469,26 +586,93 @@ def _rule_summary(kind: str, common: dict[str, Any], structured: str) -> str:
     return ". ".join(parts)
 
 
-def _is_section_heading(text: str) -> bool:
-    clean = text.strip()
-    if not clean or len(clean) > 160:
+def _is_section_heading(text: str, block: dict[str, Any] | None = None, page: dict[str, Any] | None = None) -> bool:
+    clean = _clean_heading_candidate(text)
+    if not clean or len(clean) > 120:
         return False
-    if any(pattern.search(clean) for _, pattern in SECTION_PATTERNS):
+    if _looks_like_body_sentence(clean):
+        return False
+
+    normalized = _normalized_heading_text(clean)
+    if normalized in ENGLISH_SECTION_TITLES:
         return True
-    numbered = re.match(r"^\d+(\.\d+)*\.?\s+([A-Z][A-Za-z0-9 ,:()/-]{2,120})$", clean)
-    if not numbered:
+    if any(pattern.fullmatch(clean) for _, pattern in SECTION_PATTERNS):
+        return True
+
+    numbered = re.match(r"^(?:\d+(?:\.\d+)*|[IVX]{1,6})\.?\s+(.+)$", clean, re.I)
+    if numbered:
+        title = _normalized_heading_text(numbered.group(1))
+        if title in ENGLISH_SECTION_TITLES:
+            return True
+        return _is_short_title_like(numbered.group(1), block, page)
+
+    if _is_short_title_like(clean, block, page):
+        return True
+    return False
+
+
+def _clean_heading_candidate(text: str) -> str:
+    first = next((line.strip() for line in str(text or "").splitlines() if line.strip()), "")
+    return re.sub(r"\s+", " ", first).strip()
+
+
+def _normalized_heading_text(text: str) -> str:
+    clean = _clean_heading_candidate(text)
+    clean = re.sub(r"^(?:\d+(?:\.\d+)*|[IVX]{1,6})\.?\s+", "", clean, flags=re.I)
+    clean = clean.strip(" .:-\u2013\u2014").lower()
+    clean = re.sub(r"\s+", " ", clean)
+    return clean
+
+
+def _looks_like_body_sentence(text: str) -> bool:
+    clean = text.strip()
+    lowered = clean.lower()
+    if re.match(r"^abstract\s*[-\u2013\u2014:]\s+\w+", clean, re.I):
+        return True
+    if clean[0].islower():
+        return True
+    if clean.endswith("-") and len(clean.split()) >= 5:
+        return True
+    if re.search(r"[.!?]\s+[A-Z]", clean):
+        return True
+    words = re.findall(r"[A-Za-z]+", clean)
+    if len(words) > 10:
+        return True
+    if len(words) >= 6 and sum(1 for word in words if word.lower() in SECTION_SENTENCE_MARKERS) >= 2:
+        return True
+    if lowered.startswith(("model ", "these ", "this ", "we ", "our ", "the ")):
+        return True
+    return False
+
+
+def _is_short_title_like(text: str, block: dict[str, Any] | None = None, page: dict[str, Any] | None = None) -> bool:
+    clean = _clean_heading_candidate(text)
+    words = re.findall(r"[A-Za-z0-9]+", clean)
+    if not 1 <= len(words) <= 8 or clean.endswith("."):
         return False
-    title = numbered.group(2).strip()
-    words = re.findall(r"[A-Za-z0-9]+", title)
-    if len(words) > 10 or title.endswith("."):
+    if any(word.lower() in SECTION_SENTENCE_MARKERS for word in words) and len(words) > 4:
         return False
-    sentence_markers = {"given", "that", "our", "we", "this", "these", "those", "takes", "take", "into", "account", "is", "are", "was", "were", "has", "have"}
-    if len(words) > 5 and any(word.lower() in sentence_markers for word in words):
-        return False
-    return True
+    letters = re.findall(r"[A-Za-z]", clean)
+    uppercase_ratio = (sum(1 for letter in letters if letter.isupper()) / len(letters)) if letters else 0
+    style_score = 0
+    if block:
+        style_score += 1 if block.get("bold") else 0
+        style_score += 1 if float(block.get("max_font_size") or 0) >= 11.5 else 0
+        style_score += 1 if float(block.get("uppercase_ratio") or uppercase_ratio) >= 0.55 else 0
+        bbox = block.get("bbox") or []
+        if len(bbox) == 4 and page and page.get("height"):
+            y0 = float(bbox[1])
+            if y0 < float(page["height"]) * 0.25:
+                style_score += 1
+    if uppercase_ratio >= 0.65 and len(words) <= 6:
+        style_score += 1
+    return style_score >= 2
 
 
 def normalize_section_name(title: str) -> str:
+    normalized = _normalized_heading_text(title)
+    if normalized in ENGLISH_SECTION_TITLES:
+        return ENGLISH_SECTION_TITLES[normalized]
     for normalized, pattern in SECTION_PATTERNS:
         if pattern.search(title.strip()):
             return normalized

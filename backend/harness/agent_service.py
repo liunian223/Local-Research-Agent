@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +20,7 @@ from note_skill import check_required_note_sections, quality_json, run_deep_pape
 from pdf_tools import extract_metadata, safe_filename, sha256_bytes
 from rag import note_to_chunks
 from semantic_chunker import build_semantic_chunks
-from structured_retriever import build_evidence_bundle, collect_structured_scope_chunks, retrieve_structured_evidence
+from structured_retriever import build_evidence_bundle, collect_structured_scope_chunks, evidence_type_stats, retrieve_structured_evidence
 from tool_gateway import ToolGateway
 from vector_store import VECTOR_STORE
 from vision.image_asset_selector import question_requires_vision, select_image_assets
@@ -116,17 +118,28 @@ def retrieve_evidence(gateway: ToolGateway, conn: Any, scope: str, paper_id: str
     )
 
 
-NOTE_RETRIEVAL_PLAN: list[dict[str, Any]] = [
-    {"name": "abstract", "query": "abstract summary contribution problem", "keywords": ["abstract", "摘要"], "limit": 2},
-    {"name": "introduction", "query": "introduction background motivation problem related work", "keywords": ["introduction", "background", "motivation", "related work", "引言", "背景"], "limit": 2},
-    {"name": "method", "query": "method methodology approach model framework algorithm", "keywords": ["method", "methodology", "approach", "model", "framework", "algorithm", "方法", "模型", "算法"], "limit": 3},
-    {"name": "experiment", "query": "experiment evaluation setup dataset baseline metrics", "keywords": ["experiment", "evaluation", "dataset", "baseline", "metric", "实验", "评测"], "limit": 3},
-    {"name": "result", "query": "results findings performance analysis ablation table figure", "keywords": ["result", "finding", "performance", "ablation", "结果", "分析"], "limit": 3},
-    {"name": "discussion", "query": "discussion implication analysis interpretation", "keywords": ["discussion", "implication", "analysis", "讨论"], "limit": 2},
-    {"name": "conclusion", "query": "conclusion limitation future work", "keywords": ["conclusion", "limitation", "future work", "结论", "局限"], "limit": 2},
-]
-
 NOTE_KEY_EVIDENCE_SECTIONS = ["abstract", "introduction", "method", "experiment", "result", "conclusion"]
+NOTE_VISUAL_SOURCE_TYPES = {"figure", "table", "page_summary"}
+NOTE_RESULT_FALLBACK_KEYWORDS = [
+    "accuracy",
+    "performance",
+    "comparison",
+    "results show",
+    "result shows",
+    "outperform",
+    "ablation",
+    "baseline",
+    "metric",
+]
+NOTE_CONCLUSION_FALLBACK_KEYWORDS = [
+    "conclusion",
+    "conclusions",
+    "future work",
+    "limitations",
+    "limitation",
+    "we conclude",
+    "in summary",
+]
 
 NOTE_RETRIEVAL_PLAN = [
     {"name": "abstract", "query": "abstract summary contribution problem", "keywords": ["abstract"], "limit": 2},
@@ -170,6 +183,8 @@ def retrieve_note_plan_evidence(
     forced_abstract: list[dict[str, Any]] = []
     forced_abstract.extend(_select_note_rows_for_category(rows, NOTE_RETRIEVAL_PLAN[0], force_abstract=True))
     forced_abstract.extend(item for item in (initial_evidence or []) if _is_note_abstract_item(item))
+    if not forced_abstract:
+        forced_abstract.extend(_abstract_excerpt_fallback(rows, 2))
     abstract_added = add_items(forced_abstract, "abstract", "forced_abstract", 2)
     if abstract_added:
         plan_counts["abstract"] = abstract_added
@@ -227,16 +242,18 @@ def _is_note_abstract_item(item: dict[str, Any]) -> bool:
     haystack = " ".join(
         str(value or "")
         for value in [
+            item.get("note_plan_category"),
             item.get("section_name"),
             item.get("section_path"),
             item.get("section_role"),
             item.get("chunk_role"),
             metadata.get("section_role"),
             metadata.get("chunk_role"),
-            item.get("text", "")[:200],
         ]
     ).lower()
-    return bool(item.get("is_abstract") or metadata.get("is_abstract")) or "abstract" in haystack or "鎽樿" in haystack
+    if bool(item.get("is_abstract") or metadata.get("is_abstract")) or "abstract" in haystack:
+        return True
+    return False
 
 
 def _select_note_rows_for_category(rows: list[dict[str, Any]], plan: dict[str, Any], force_abstract: bool = False) -> list[dict[str, Any]]:
@@ -262,6 +279,226 @@ def _select_note_rows_for_category(rows: list[dict[str, Any]], plan: dict[str, A
     return selected
 
 
+def _abstract_excerpt_fallback(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    for row in rows:
+        text = row.get("text") or row.get("content") or ""
+        match = re.search(r"\babstract\b\s*[-:—–]?\s*(.+?)(?:\b(?:keywords?|index terms|introduction|related work|method|experiment|results?|conclusion)\b|$)", text, re.I | re.S)
+        if not match:
+            continue
+        excerpt = re.sub(r"\s+", " ", match.group(1)).strip()[: config.MAX_EVIDENCE_CHARS]
+        if not excerpt:
+            continue
+        selected.append(
+            {
+                **row,
+                "chunk_id": f"{row.get('chunk_id') or row.get('id') or 'row'}_abstract_excerpt",
+                "id": f"{row.get('id') or row.get('chunk_id') or 'row'}_abstract_excerpt",
+                "section_name": "Abstract",
+                "section_path": "Abstract",
+                "source_type": row.get("source_type") or "text",
+                "text": excerpt,
+                "is_abstract": True,
+                "chunk_role": "abstract",
+                "note_plan_category": "abstract",
+                "note_plan_source": "abstract_excerpt_fallback",
+            }
+        )
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def finalize_note_generation_evidence(evidence: list[dict[str, Any]], rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    working = list(evidence or [])
+    before_coverage = assess_note_evidence_coverage(working)
+    fallback_added: dict[str, int] = {}
+    for section, keywords in {"result": NOTE_RESULT_FALLBACK_KEYWORDS, "conclusion": NOTE_CONCLUSION_FALLBACK_KEYWORDS}.items():
+        if section in before_coverage["missing_body_evidence"]:
+            added = _keyword_fallback_rows(rows, section, keywords, working, 3)
+            if added:
+                working.extend(added)
+                fallback_added[section] = len(added)
+
+    deduped = _dedupe_note_evidence(working)
+    abstract = [item for item in deduped if _classify_note_evidence_section(item) == "abstract"][:2]
+    body_by_section: list[dict[str, Any]] = []
+    for section in ["introduction", "method", "experiment", "result", "conclusion"]:
+        body_by_section.extend(
+            item
+            for item in deduped
+            if _classify_note_evidence_section(item) == section
+            and item.get("source_type") not in NOTE_VISUAL_SOURCE_TYPES
+            and item.get("source_type") != "section_summary"
+        )
+    other_text = [
+        item
+        for item in deduped
+        if item not in abstract
+        and item not in body_by_section
+        and item.get("source_type") not in NOTE_VISUAL_SOURCE_TYPES
+        and item.get("source_type") != "section_summary"
+    ]
+    summaries = [
+        item
+        for item in deduped
+        if item not in abstract
+        and item not in body_by_section
+        and item not in other_text
+        and item.get("source_type") == "section_summary"
+    ][:4]
+    visual_limit = min(3, max(1, (len(body_by_section) + len(other_text)) // 3))
+    visual = [item for item in deduped if item.get("source_type") in NOTE_VISUAL_SOURCE_TYPES][:visual_limit]
+
+    ordered = _dedupe_note_evidence(abstract + body_by_section + other_text + summaries + visual)
+    ordered = [_normalize_note_item_for_bundle(item) for item in ordered]
+    for rank, item in enumerate(ordered, start=1):
+        item["rank"] = rank
+    visual_count = sum(1 for item in ordered if item.get("source_type") in NOTE_VISUAL_SOURCE_TYPES)
+    return ordered, {
+        "before_coverage": before_coverage,
+        "fallback_added": fallback_added,
+        "visual_evidence_count": visual_count,
+        "visual_evidence_limit": visual_limit,
+        "body_text_evidence_count": sum(1 for item in ordered if item.get("source_type") not in NOTE_VISUAL_SOURCE_TYPES and item.get("source_type") != "section_summary"),
+    }
+
+
+def _keyword_fallback_rows(rows: list[dict[str, Any]], section: str, keywords: list[str], existing: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    existing_keys = {_note_evidence_key(item) for item in existing}
+    selected: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("source_type") in NOTE_VISUAL_SOURCE_TYPES or row.get("source_type") == "section_summary":
+            continue
+        text = (row.get("text") or row.get("content") or "")[: config.MAX_EVIDENCE_CHARS]
+        haystack = " ".join(str(row.get(key) or "") for key in ["section_name", "section_path", "context_prefix", "text", "content"]).lower()
+        if not text or not any(keyword in haystack for keyword in keywords):
+            continue
+        item = {
+            **row,
+            "score": row.get("score", 0),
+            "text": text,
+            "note_plan_category": section,
+            "note_plan_source": "keyword_fallback",
+        }
+        key = _note_evidence_key(item)
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _dedupe_note_evidence(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for item in items:
+        key = _note_evidence_key(item)
+        if key in seen:
+            continue
+        text = (item.get("text") or item.get("content") or "")[: config.MAX_EVIDENCE_CHARS]
+        if not text:
+            continue
+        seen.add(key)
+        deduped.append({**item, "text": text})
+    return deduped
+
+
+def _note_evidence_key(item: dict[str, Any]) -> str:
+    text = (item.get("text") or item.get("content") or "")[:120]
+    return str(item.get("chunk_id") or item.get("id") or f"{item.get('source_type')}:{item.get('section_path')}:{text}")
+
+
+def build_final_note_evidence_bundle(evidence: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any]:
+    final_meta = {key: value for key, value in meta.items() if key != "evidence_bundle"}
+    normalized = []
+    for item in evidence:
+        normalized.append(_normalize_note_item_for_bundle(item))
+    return build_evidence_bundle(normalized, final_meta)
+
+
+def _normalize_note_item_for_bundle(item: dict[str, Any]) -> dict[str, Any]:
+    if _classify_note_evidence_section(item) == "abstract":
+        return {**item, "is_abstract": True, "chunk_role": "abstract"}
+    metadata = dict(item.get("metadata") or {})
+    metadata["is_abstract"] = False
+    if str(metadata.get("chunk_role") or "").lower() == "abstract":
+        metadata["chunk_role"] = "body"
+    normalized = {**item, "is_abstract": False, "metadata": metadata}
+    if str(normalized.get("chunk_role") or "").lower() == "abstract":
+        normalized["chunk_role"] = "body"
+    return normalized
+
+
+def note_logical_and_artifact_sections(evidence: list[dict[str, Any]]) -> dict[str, Any]:
+    logical: set[str] = set()
+    artifacts: set[str] = set()
+    tables: set[str] = set()
+    figures: set[str] = set()
+    formulas: set[str] = set()
+    for item in evidence:
+        source_type = item.get("source_type") or "text"
+        section = str(item.get("section_path") or item.get("section_name") or "").strip()
+        section_lower = section.lower().replace(" ", "")
+        if section_lower in {"n"}:
+            artifacts.add(section or "noise")
+            formulas.add(section or "N")
+            continue
+        if source_type == "table" or re.match(r"^table[\divx]+", section_lower, re.I):
+            artifacts.add(section or "table")
+            tables.update(_metadata_values(item, "table_ids") or [str(item.get("table_id") or item.get("chunk_id") or section or "table")])
+            continue
+        if source_type == "figure" or re.match(r"^(fig|figure)[\divx]+", section_lower, re.I):
+            artifacts.add(section or "figure")
+            figures.update(_metadata_values(item, "figure_ids") or [str(item.get("figure_id") or item.get("chunk_id") or section or "figure")])
+            continue
+        if re.search(r"\|?[A-Z]\d+\s*(?:∪|\\cup|\+|union)\s*[A-Z]?\d+\|?", section):
+            artifacts.add(section)
+            formulas.add(section)
+            continue
+        normalized = _classify_note_evidence_section(item)
+        if normalized in {"abstract", "introduction", "method", "experiment", "result", "conclusion"}:
+            logical.add(section or normalized.title())
+        elif "related work" in section.lower() or "discussion" in section.lower():
+            logical.add(section)
+        elif section.lower().startswith("references"):
+            artifacts.add(section)
+    return {
+        "retrieved_sections": sorted(logical),
+        "logical_retrieved_sections": sorted(logical),
+        "artifact_sections": sorted(artifacts),
+        "retrieved_tables": sorted(value for value in tables if value),
+        "retrieved_figures": sorted(value for value in figures if value),
+        "retrieved_formulas": sorted(value for value in formulas if value),
+    }
+
+
+def _metadata_values(item: dict[str, Any], key: str) -> list[str]:
+    value = item.get(key)
+    if value is None:
+        metadata = item.get("metadata") or {}
+        value = metadata.get(key)
+    if isinstance(value, list):
+        return [str(part) for part in value if part]
+    if isinstance(value, str) and value:
+        return [value]
+    return []
+
+
+def summarize_section_summary_quality(section_summaries: dict[str, Any] | None) -> dict[str, Any]:
+    section_summaries = section_summaries or {}
+    key_sections = ["abstract", "introduction", "method", "experiment", "result", "conclusion"]
+    missing = [section for section in key_sections if (section_summaries.get(section) or {}).get("missing")]
+    return {
+        "ok": not missing,
+        "missing_sections": missing,
+        "section_count": len(section_summaries),
+        "sections": section_summaries,
+    }
+
+
 def assess_note_evidence_coverage(evidence: list[dict[str, Any]]) -> dict[str, Any]:
     counts = {section: 0 for section in NOTE_KEY_EVIDENCE_SECTIONS}
     body_counts = {section: 0 for section in NOTE_KEY_EVIDENCE_SECTIONS}
@@ -270,7 +507,7 @@ def assess_note_evidence_coverage(evidence: list[dict[str, Any]]) -> dict[str, A
         if section not in counts:
             continue
         counts[section] += 1
-        if item.get("source_type") != "section_summary" and (item.get("text") or "").strip():
+        if item.get("source_type") not in NOTE_VISUAL_SOURCE_TYPES and item.get("source_type") != "section_summary" and (item.get("text") or "").strip():
             body_counts[section] += 1
     missing = [section for section in NOTE_KEY_EVIDENCE_SECTIONS if counts[section] == 0]
     missing_body = [section for section in NOTE_KEY_EVIDENCE_SECTIONS if body_counts[section] == 0]
@@ -286,18 +523,37 @@ def assess_note_evidence_coverage(evidence: list[dict[str, Any]]) -> dict[str, A
 
 
 def _classify_note_evidence_section(item: dict[str, Any]) -> str:
+    category = str(item.get("note_plan_category") or "").lower()
+    category_map = {
+        "abstract": "abstract",
+        "background_introduction": "introduction",
+        "introduction": "introduction",
+        "method": "method",
+        "experiment": "experiment",
+        "result": "result",
+        "discussion_conclusion": "conclusion",
+        "conclusion": "conclusion",
+        "limitation": "conclusion",
+    }
+    if category in category_map:
+        return category_map[category]
     haystack = " ".join(
         str(item.get(key) or "")
         for key in ["note_plan_category", "section_role", "chunk_role", "section_name", "section_path", "context_prefix", "text"]
     ).lower()
-    if item.get("is_abstract") or "abstract" in haystack or "摘要" in haystack:
+    abstract_haystack = " ".join(str(item.get(key) or "") for key in ["note_plan_category", "section_role", "chunk_role", "section_name", "section_path"]).lower()
+    if item.get("is_abstract") or "abstract" in abstract_haystack:
         return "abstract"
+    if any(keyword in haystack for keyword in NOTE_RESULT_FALLBACK_KEYWORDS):
+        return "result"
+    if any(keyword in haystack for keyword in NOTE_CONCLUSION_FALLBACK_KEYWORDS):
+        return "conclusion"
     mapping = {
-        "introduction": ["introduction", "background", "motivation", "related work", "引言", "背景"],
-        "method": ["method", "methodology", "approach", "model", "framework", "algorithm", "方法", "模型", "算法"],
-        "experiment": ["experiment", "evaluation", "dataset", "baseline", "metric", "实验", "评测"],
-        "result": ["result", "finding", "performance", "ablation", "结果"],
-        "conclusion": ["conclusion", "discussion", "limitation", "future work", "结论", "讨论", "局限"],
+        "introduction": ["introduction", "background", "motivation", "related work"],
+        "method": ["method", "methodology", "approach", "model", "framework", "algorithm"],
+        "experiment": ["experiment", "evaluation", "dataset", "baseline", "metric"],
+        "result": ["result", "finding", "performance", "ablation"],
+        "conclusion": ["conclusion", "discussion", "limitation", "future work"],
     }
     for section, tokens in mapping.items():
         if any(token in haystack for token in tokens):
@@ -308,7 +564,7 @@ def _classify_note_evidence_section(item: dict[str, Any]) -> str:
 def synthesize_answer_with_optional_llm(gateway: ToolGateway, task_id: str, question: str, evidence: list[dict[str, Any]], fallbacks: list[str]) -> str:
     if not evidence:
         fallbacks.append("no_matching_evidence")
-        return "没有检索到可引用的 evidence。请先确认 PDF 已成功解析并完成索引，或换一个更具体的问题再试。"
+        return "No matching evidence was retrieved. Please confirm the PDF was parsed and indexed, or ask a more specific question."
 
     model_gateway = get_model_gateway()
     system, prompt = build_rag_answer_prompt_text(question, evidence)
@@ -326,7 +582,7 @@ def synthesize_answer_with_optional_llm(gateway: ToolGateway, task_id: str, ques
     fallbacks.append("model_chat_failed_local_rag_answer_used")
     log_mcp(gateway.conn, task_id, "llm", "model_chat", result.model, "Model call failed.", status="error", error=result.error)
     bullets = "\n".join(f"- {item['section_name']}: {item['text'][:220]}" for item in evidence[:3])
-    return f"模型调用失败，已使用本地 RAG 兜底回答：\n{bullets}"
+    return f"Model call failed; using a local RAG fallback answer.\n{bullets}"
 
 
 def collect_note_image_context(conn: Any, paper_id: str, evidence: list[dict[str, Any]], limit: int | None = None) -> tuple[list[str], str]:
@@ -600,11 +856,49 @@ def generate_note(
     retrieve_meta: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[str], dict[str, Any]]:
     evidence, retrieve_meta = retrieve_note_plan_evidence(gateway, conn, paper, query, evidence, retrieve_meta)
-    evidence_bundle = build_evidence_bundle(evidence or [], retrieve_meta or {})
+    initial_evidence_bundle = (retrieve_meta or {}).get("evidence_bundle") or {}
+    base_retrieve_meta = {key: value for key, value in (retrieve_meta or {}).items() if key != "evidence_bundle"}
     rows = collect_structured_scope_chunks(conn, "paper_only", paper["id"])
     if not evidence and rows:
         evidence = [{**row, "rank": idx + 1, "score": 0, "text": row.get("text", "")[: config.MAX_EVIDENCE_CHARS]} for idx, row in enumerate(rows[:5])]
-        evidence_bundle = build_evidence_bundle(evidence, retrieve_meta or {})
+    evidence, final_evidence_meta = finalize_note_generation_evidence(evidence or [], rows)
+    evidence_coverage = assess_note_evidence_coverage(evidence or [])
+    final_stats = evidence_type_stats(evidence or [])
+    section_meta = note_logical_and_artifact_sections(evidence or [])
+    retrieve_meta = {
+        **base_retrieve_meta,
+        "initial_evidence_bundle": initial_evidence_bundle,
+        "retrieval_mode": "note_chapterized_plan",
+        "retrieval_intent": "generate_note",
+        "query_analysis": {"intent": "generate_note", "complexity": "complex", "abstract_mode": "force_include_no_downweight"},
+        "retrieval_plan": {
+            "mode": "note_chapterized_plan",
+            "reason": "generate_note uses chapterized retrieval and final body-first evidence selection",
+            "coverage_requirements": {"target_sections": NOTE_KEY_EVIDENCE_SECTIONS},
+            "note_retrieval_plan": [plan["name"] for plan in NOTE_RETRIEVAL_PLAN],
+        },
+        "evidence_stats": final_stats,
+        "abstract_control": {
+            **(base_retrieve_meta.get("abstract_control") or {}),
+            "has_abstract": final_stats.get("abstract_chunks", 0) > 0,
+            "abstract_chunks_recalled": final_stats.get("abstract_chunks", 0),
+            "abstract_chunks_used": final_stats.get("abstract_chunks", 0),
+            "abstract_penalty_applied": False,
+        },
+        "rerank": {"candidate_count": base_retrieve_meta.get("candidate_count", len(rows)), "final_count": len(evidence), "reranker": "note_chapterized_body_first_v1"},
+        "evidence_coverage": evidence_coverage,
+        "coverage_check": {
+            "sufficient": evidence_coverage["ok"],
+            "covered_sections": {section: evidence_coverage["section_counts"].get(section, 0) > 0 for section in NOTE_KEY_EVIDENCE_SECTIONS},
+            "missing_sections": evidence_coverage["missing_key_evidence"],
+            "missing_body_sections": evidence_coverage["missing_body_evidence"],
+        },
+        "final_note_evidence": final_evidence_meta,
+        **section_meta,
+    }
+    evidence_bundle = build_final_note_evidence_bundle(evidence or [], retrieve_meta or {})
+    retrieve_meta["evidence_bundle"] = evidence_bundle
+    retrieve_meta["final_note_evidence_bundle"] = evidence_bundle
     evidence_coverage = assess_note_evidence_coverage(evidence or [])
     full_text = "\n\n".join(row.get("text", "") for row in rows)
     skill_result = gateway.invoke(
@@ -623,6 +917,8 @@ def generate_note(
     )
     markdown = skill_result["note_markdown"]
     quality = skill_result["quality_check"]
+    template_quality_check = {key: value for key, value in quality.items() if key not in {"section_summaries"}}
+    section_summary_quality_check = summarize_section_summary_quality(quality.get("section_summaries") if isinstance(quality.get("section_summaries"), dict) else {})
     phases = skill_result["skill_phases"]
     fallbacks: list[Any] = list(skill_result.get("fallbacks", []))
     local_template_used = True
@@ -633,10 +929,11 @@ def generate_note(
     prompt = f"{prompt}\n\nStructured evidence bundle:\n{format_grouped_evidence_for_prompt(evidence_bundle)}\n\nRules: force include and use the top abstract_chunks as first-class overview evidence for generate_note. Do not downweight abstract evidence in this task, but do not use abstract text as a substitute for missing body method/experiment/result evidence. If body evidence is insufficient, say so."
     image_paths, image_context = collect_note_image_context(conn, paper["id"], evidence)
     if image_context:
-        prompt = f"{prompt}\n\n{image_context}\n\n请结合这些图片附件和文本 evidence 生成笔记；涉及图中信息时注明来自图像/图注/附近文本的证据。"
+        prompt = f"{prompt}\n\n{image_context}\n\nUse these image attachments together with the text evidence when generating the note. When citing visual information, identify whether it comes from an image, caption, or nearby text."
         phases.append({"name": "multimodal_evidence", "status": "success", "summary": f"Attached {len(image_paths)} figure/page images for model note generation."})
     else:
         phases.append({"name": "multimodal_evidence", "status": "skipped", "summary": "No extracted figure/page images available for model note generation."})
+    llm_started = time.perf_counter()
     llm_result = model_gateway.generate_text(
         prompt,
         system=system,
@@ -645,6 +942,7 @@ def generate_note(
         max_output_tokens=3600,
         image_paths=image_paths,
     )
+    llm_latency_ms = max(1, int((time.perf_counter() - llm_started) * 1000))
     if llm_result.ok:
         llm_quality = check_required_note_sections(llm_result.content)
         llm_note_generation_status = "ok"
@@ -655,6 +953,7 @@ def generate_note(
             "model_note_generation",
             f"{llm_result.model}; images={len(image_paths)}",
             llm_result.usage_summary or f"Model note generated; images={len(image_paths)}",
+            latency_ms=llm_latency_ms,
         )
         if llm_quality["ok"]:
             markdown = llm_result.content
@@ -679,7 +978,7 @@ def generate_note(
         fallbacks.append("llm_note_generation_failed_local_note_used")
         llm_note_generation_status = "fallback"
         partial_reasons.append("llm_note_generation_failed_local_note_used")
-        log_mcp(conn, task_id, "llm", "model_note_generation", f"{llm_result.model}; images={len(image_paths)}", "Model note generation failed.", status="error", error=llm_result.error)
+        log_mcp(conn, task_id, "llm", "model_note_generation", f"{llm_result.model}; images={len(image_paths)}", "Model note generation failed.", status="error", error=llm_result.error, latency_ms=llm_latency_ms)
         phases.append({"name": "llm_note_generation", "status": "fallback", "summary": "Model call failed; used local note template."})
     if local_template_used:
         partial_reasons.append("local_template_used")
@@ -692,10 +991,20 @@ def generate_note(
         partial_reasons.append("llm_note_generation_not_successful")
     partial_reasons = sorted(set(partial_reasons))
     downgrade_reasons = explain_note_partial_reasons(partial_reasons)
-    if not evidence_coverage["ok"]:
-        quality["ok"] = False
+    final_quality_ok = evidence_coverage["ok"] and llm_note_generation_status == "ok" and not local_template_used
+    quality_without_section_summaries = {key: value for key, value in quality.items() if key != "section_summaries"}
     quality = {
-        **quality,
+        **quality_without_section_summaries,
+        "ok": final_quality_ok,
+        "template_quality_check": template_quality_check,
+        "section_summary_quality_check": section_summary_quality_check,
+        "evidence_coverage_check": {
+            "ok": evidence_coverage["ok"],
+            "section_counts": evidence_coverage["section_counts"],
+            "body_section_counts": evidence_coverage["body_section_counts"],
+            "missing_key_evidence": evidence_coverage["missing_key_evidence"],
+            "missing_body_evidence": evidence_coverage["missing_body_evidence"],
+        },
         "evidence_coverage": evidence_coverage,
         "evidence_coverage_ok": evidence_coverage["ok"],
         "local_template_used": local_template_used,
@@ -823,6 +1132,7 @@ def generate_note(
         "pdf_attachment_path": str(attachment_path),
         "evidence_group_counts": quality.get("evidence_group_counts", {}),
         "evidence_coverage": evidence_coverage,
+        "retrieval": retrieve_meta,
     }
     return markdown, quality, phases, evidence, fallbacks, note_generation
 
@@ -862,7 +1172,7 @@ def synthesize_answer_from_bundle_with_optional_llm(
 ) -> str:
     if not evidence:
         fallbacks.append("no_matching_evidence")
-        return "没有检索到足够的 evidence。当前回答可靠性较低，建议重新上传更完整的 PDF 或换一个更具体的问题。"
+        return "No matching evidence was retrieved. The current answer would be low-confidence; please confirm the PDF was fully parsed and indexed, or ask a more specific question."
     model_gateway = get_model_gateway()
     grouped = format_grouped_evidence_for_prompt(evidence_bundle)
     query_analysis = retrieval.get("query_analysis") or {}
@@ -901,7 +1211,7 @@ abstract_mode: {query_analysis.get('abstract_mode', '')}
     fallbacks.append("model_chat_failed_local_rag_answer_used")
     log_mcp(gateway.conn, task_id, "llm", "model_chat", result.model, "Model call failed.", status="error", error=result.error)
     bullets = "\n".join(f"- {item.get('section_name', '')}: {(item.get('text') or '')[:220]}" for item in evidence[:3])
-    return f"模型调用失败，已使用本地 grouped evidence 兜底回答：\n{bullets}"
+    return f"Model call failed; using a local grouped-evidence fallback answer.\n{bullets}"
 
 
 def handle_vision_chat(
@@ -976,26 +1286,25 @@ def handle_vision_chat(
         page = item.get("page_start") or item.get("page_no") or ""
         section = item.get("section_path") or item.get("section_name") or "Body"
         evidence_lines.append(f"- page={page} section={section}: {(item.get('text') or '')[:500]}")
-    prompt = f"""用户问题:
+    prompt = f"""User question:
 {question}
 
-当前论文:
+Current paper:
 - title: {paper.get('title') or ''}
 - authors: {paper.get('authors') or ''}
 - paper_id: {paper.get('id') or ''}
 
-RAG evidence 摘要:
+RAG evidence summary:
 {chr(10).join(evidence_lines) or 'No textual evidence retrieved.'}
 
-图像路径:
+Image paths:
 {chr(10).join(selected_paths)}
 
-要求:
-1. 用中文回答。
-2. 只依据文本 evidence 和这些 PDF 派生图像回答。
-3. 不要编造图像中不存在或看不清的信息；看不清时直接说明。
-4. 区分图像观察、图注/附近文本、以及推理。
-"""
+Requirements:
+1. Answer in Chinese.
+2. Use only the textual evidence and these PDF-derived images.
+3. Do not invent details that are absent from or unclear in the images; state uncertainty directly.
+4. Distinguish image observations, captions, nearby text, and inference."""
     result = get_model_gateway().generate_text(
         prompt,
         system="You are the Note Skill Agent vision handler. Ground answers in PDF-derived images and local RAG evidence.",
@@ -1044,7 +1353,7 @@ def run_upload_graph(conn: Any, task_id: str, task_type: str, file_bytes: bytes,
             inner["needs_evidence"] = True
         else:
             inner["phase"] = "IMPORT_DONE"
-            inner["answer"] = f"已接收 PDF《{paper['title']}》，解析状态：{paper['parse_status']}，索引状态：{paper['vector_status']}。"
+            inner["answer"] = f"Received PDF '{paper['title']}'. Parse status: {paper['parse_status']}; index status: {paper['vector_status']}."
             inner["message_type"] = "paper_imported"
         return inner
 
@@ -1084,18 +1393,34 @@ def run_upload_graph(conn: Any, task_id: str, task_type: str, file_bytes: bytes,
         inner["obsidian_pdf_path"] = note_generation.get("pdf_attachment_path", "")
         inner["skill_phases"] = phases
         inner["rag_evidence"] = evidence
+        inner["retrieval"] = note_generation.get("retrieval") or inner.get("retrieval") or {}
+        inner["retrieve_meta"] = inner["retrieval"]
+        inner["evidence_bundle"] = build_final_note_evidence_bundle(evidence, inner["retrieval"])
+        log_a2a(
+            conn,
+            task_id,
+            "Knowledge RAG Agent",
+            "Note Skill Agent",
+            "final_evidence_bundle_ready",
+            {
+                "count": len(evidence),
+                "scope": "paper_only",
+                "evidence_bundle": inner["evidence_bundle"],
+                "final_note_evidence": inner["retrieval"].get("final_note_evidence", {}),
+                "evidence_stats": inner["retrieval"].get("evidence_stats", {}),
+            },
+        )
         inner.setdefault("fallbacks", []).extend(note_fallbacks)
         inner["note_ready"] = True
         inner["phase"] = "NOTE_READY"
         note_is_partial = note_generation.get("status") == "partial" or note_generation.get("local_template_used") or has_partial_note_fallback(inner.get("fallbacks", []))
         if note_is_partial:
-            inner["answer"] = f"已导入 PDF《{paper['title']}》，并生成降级版 Obsidian 阅读笔记，部分章节可能需要人工补充。"
             downgrade_reason = format_note_downgrade_for_answer(note_generation)
             inner["answer"] = f"Generated a partial Obsidian reading note for {paper['title']}. Downgrade reason: {downgrade_reason}. Some sections may need manual completion."
             inner["task_status"] = "partial"
             inner["message_type"] = "partial_success"
         else:
-            inner["answer"] = f"已导入 PDF《{paper['title']}》，并生成 Obsidian Markdown 阅读笔记。"
+            inner["answer"] = f"Imported PDF '{paper['title']}' and generated an Obsidian Markdown reading note."
             inner["task_status"] = "done"
             inner["message_type"] = "note_generated"
         inner["artifacts"] = {
@@ -1172,18 +1497,34 @@ def run_chat_graph(conn: Any, task_id: str, payload: ChatMessage, paper: dict[st
         inner["obsidian_pdf_path"] = note_generation.get("pdf_attachment_path", "")
         inner["skill_phases"] = phases
         inner["rag_evidence"] = evidence
+        inner["retrieval"] = note_generation.get("retrieval") or inner.get("retrieval") or {}
+        inner["retrieve_meta"] = inner["retrieval"]
+        inner["evidence_bundle"] = build_final_note_evidence_bundle(evidence, inner["retrieval"])
+        log_a2a(
+            conn,
+            task_id,
+            "Knowledge RAG Agent",
+            "Note Skill Agent",
+            "final_evidence_bundle_ready",
+            {
+                "count": len(evidence),
+                "scope": payload.chat_scope,
+                "evidence_bundle": inner["evidence_bundle"],
+                "final_note_evidence": inner["retrieval"].get("final_note_evidence", {}),
+                "evidence_stats": inner["retrieval"].get("evidence_stats", {}),
+            },
+        )
         inner.setdefault("fallbacks", []).extend(note_fallbacks)
         inner["note_ready"] = True
         inner["phase"] = "NOTE_READY"
         note_is_partial = note_generation.get("status") == "partial" or note_generation.get("local_template_used") or has_partial_note_fallback(inner.get("fallbacks", []))
         if note_is_partial:
-            inner["answer"] = f"已为《{paper['title']}》生成降级版 Obsidian 阅读笔记，部分章节可能需要人工补充。"
             downgrade_reason = format_note_downgrade_for_answer(note_generation)
             inner["answer"] = f"Generated a partial Obsidian reading note for {paper['title']}. Downgrade reason: {downgrade_reason}. Some sections may need manual completion."
             inner["task_status"] = "partial"
             inner["message_type"] = "partial_success"
         else:
-            inner["answer"] = f"已为《{paper['title']}》生成 Obsidian Markdown 阅读笔记。"
+            inner["answer"] = f"Generated an Obsidian Markdown reading note for {paper['title']}."
             inner["task_status"] = "done"
             inner["message_type"] = "note_generated"
         inner["artifacts"] = {"markdown_path": paper.get("obsidian_note_path", ""), "pdf_path": paper.get("file_path", "")}
@@ -1239,5 +1580,4 @@ def run_chat_graph(conn: Any, task_id: str, payload: ChatMessage, paper: dict[st
         generate_note_handler=note_handler,
         answer_chat_handler=answer_handler,
     )
-
 
