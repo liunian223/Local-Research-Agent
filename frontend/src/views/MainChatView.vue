@@ -197,9 +197,21 @@ async function loadChatHistory() {
 }
 
 async function createSession() {
-  const response = await createChatSession("新对话");
-  await loadSessions();
-  await selectSession(response.session.id);
+  try {
+    error.value = "";
+    const response = await createChatSession("新对话");
+    currentSessionId.value = response.session.id;
+    currentPaper.value = null;
+    draft.value = "";
+    messages.value = [{ role: "assistant", text: readyMessage }];
+    sessions.value = [response.session, ...sessions.value.filter((session) => session.id !== response.session.id)];
+    await loadSessions();
+    await loadChatHistory();
+    await loadPapers();
+  } catch (err) {
+    console.error("Failed to create chat session", err);
+    error.value = apiMessage(err);
+  }
 }
 
 async function deleteSession(session: ChatSession) {
@@ -208,6 +220,7 @@ async function deleteSession(session: ChatSession) {
     await loadSessions();
     await selectSession(response.next_session_id || sessions.value[0]?.id || "session_default");
   } catch (err) {
+    console.error("Failed to delete chat session", err);
     error.value = apiMessage(err);
   }
 }
@@ -231,6 +244,7 @@ async function deletePaper(paper: Paper) {
     }
     await loadPapers();
   } catch (err) {
+    console.error("Failed to delete paper", err);
     error.value = apiMessage(err);
   }
 }
@@ -267,6 +281,7 @@ async function uploadFile(file: File) {
     if (paper) currentPaper.value = paper;
     await loadSessions();
   } catch (err) {
+    console.error("Failed to upload PDF", err);
     error.value = apiMessage(err);
     appendMessage({ role: "assistant", text: error.value });
   } finally {
@@ -311,6 +326,7 @@ async function sendMessage() {
     }
     await loadSessions();
   } catch (err) {
+    console.error("Failed to send chat message", err);
     error.value = apiMessage(err);
     appendMessage({ role: "assistant", text: error.value });
   } finally {
@@ -333,6 +349,7 @@ onMounted(async () => {
       if (refreshed) currentPaper.value = refreshed;
     }
   } catch (err) {
+    console.error("Failed to initialize chat view", err);
     error.value = apiMessage(err);
   }
 });

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ import config
 from deepseek_client import build_note_generation_prompt_text, build_rag_answer_prompt_text
 from database import log_a2a, log_mcp, new_id, now_iso, row_to_dict, rows_to_dicts
 from graph.state import AgentState
+from harness.decisions import log_harness_decision
 from harness.graph_runner import run_chat_agent_graph, run_upload_agent_graph
 from harness.runtime import RuntimeTaskError
 from layout_parser import parse_pdf_layout, save_layout_artifacts
@@ -61,6 +63,18 @@ def remove_local_note_generation_fallbacks(fallbacks: list[Any]) -> list[Any]:
             or (isinstance(item, str) and item in local_note_fallbacks)
         )
     ]
+
+
+def model_error_fallback(fallback_type: str, result: Any) -> dict[str, Any]:
+    structured = result.structured_error() if hasattr(result, "structured_error") else {}
+    return {
+        "type": fallback_type,
+        "message": structured.get("error_message") or getattr(result, "error", "") or "Model call failed.",
+        "provider": structured.get("provider") or getattr(result, "provider", ""),
+        "stage": structured.get("stage") or getattr(result, "stage", "chat"),
+        "error_type": structured.get("error_type") or getattr(result, "error_type", "unknown_model_error"),
+        "retryable": structured.get("retryable", getattr(result, "retryable", False)),
+    }
 
 
 def explain_note_partial_reasons(reasons: list[str]) -> list[str]:
@@ -601,9 +615,10 @@ def synthesize_answer_with_optional_llm(gateway: ToolGateway, task_id: str, ques
         return result.content
 
     fallbacks.append("model_chat_failed_local_rag_answer_used")
+    fallbacks.append(model_error_fallback("model_chat_failed_local_rag_answer_used", result))
     log_mcp(gateway.conn, task_id, "llm", "model_chat", result.model, "Model call failed.", status="error", error=result.error)
     bullets = "\n".join(f"- {item['section_name']}: {item['text'][:220]}" for item in evidence[:3])
-    return f"Model call failed; using a local RAG fallback answer.\n{bullets}"
+    return f"Model call failed ({result.error_type or 'unknown_model_error'}); using a local RAG fallback answer.\n{bullets}"
 
 
 def collect_note_image_context(conn: Any, paper_id: str, evidence: list[dict[str, Any]], limit: int | None = None) -> tuple[list[str], str]:
@@ -696,8 +711,14 @@ def collect_note_image_context(conn: Any, paper_id: str, evidence: list[dict[str
     return image_paths, "Multimodal image attachments available to the model:\n" + "\n".join(lines)
 
 
-def ingest_pdf(conn: Any, gateway: ToolGateway, task_id: str, file_bytes: bytes, original_name: str, folder_id: str) -> tuple[dict[str, Any], list[str]]:
-    fallbacks: list[str] = []
+def fallback_detail(kind: str, message: str, exc: Exception | None = None) -> dict[str, str]:
+    if exc is not None:
+        message = f"{message}: {exc.__class__.__name__}: {str(exc)[:300]}"
+    return {"type": kind, "message": message}
+
+
+def ingest_pdf(conn: Any, gateway: ToolGateway, task_id: str, file_bytes: bytes, original_name: str, folder_id: str) -> tuple[dict[str, Any], list[Any]]:
+    fallbacks: list[Any] = []
     file_hash = sha256_bytes(file_bytes)
     existing = conn.execute("SELECT * FROM papers WHERE file_sha256 = ?", (file_hash,)).fetchone()
     if existing:
@@ -708,27 +729,54 @@ def ingest_pdf(conn: Any, gateway: ToolGateway, task_id: str, file_bytes: bytes,
     filename = f"{paper_id}_{safe_filename(original_name)}.pdf"
     target = (config.PAPER_DIR / filename).resolve()
     if not str(target).startswith(str(config.PAPER_DIR.resolve())):
+        log_harness_decision(
+            conn,
+            task_id,
+            stage="file_security",
+            decision="deny",
+            reason="resolved upload path escapes paper directory",
+            agent="Knowledge RAG Agent",
+            tool="file.save_uploaded_pdf",
+            status="denied",
+        )
         raise RuntimeTaskError(400, "invalid_path", "Upload path escapes paper directory.")
-    gateway.invoke(
-        "Knowledge RAG Agent",
-        "file",
-        "save_uploaded_pdf",
-        save_uploaded_pdf,
-        target,
-        file_bytes,
-        input_summary=original_name,
-        output_summarizer=lambda value: str(target),
+    log_harness_decision(
+        conn,
+        task_id,
+        stage="file_security",
+        decision="allow",
+        reason="resolved upload path stays inside paper directory",
+        agent="Knowledge RAG Agent",
+        tool="file.save_uploaded_pdf",
+        status="ok",
     )
+    try:
+        gateway.invoke(
+            "Knowledge RAG Agent",
+            "file",
+            "save_uploaded_pdf",
+            save_uploaded_pdf,
+            target,
+            file_bytes,
+            input_summary=original_name,
+            output_summarizer=lambda value: str(target),
+        )
+    except Exception as exc:
+        raise RuntimeTaskError(500, "upload_save_failed", f"Could not save uploaded PDF: {exc}") from exc
 
-    parsed = gateway.invoke(
-        "Knowledge RAG Agent",
-        "file",
-        "read_pdf_text",
-        read_pdf_text,
-        target,
-        input_summary=str(target),
-        output_summarizer=lambda value: f"parser={value['parser']}; chars={len(value['text'])}; pages={value['page_count']}",
-    )
+    try:
+        parsed = gateway.invoke(
+            "Knowledge RAG Agent",
+            "file",
+            "read_pdf_text",
+            read_pdf_text,
+            target,
+            input_summary=str(target),
+            output_summarizer=lambda value: f"parser={value['parser']}; chars={len(value['text'])}; pages={value['page_count']}",
+        )
+    except Exception as exc:
+        parsed = {"text": "", "page_count": 0, "parser": "failed", "warnings": [str(exc)[:500]]}
+        fallbacks.append(fallback_detail("pdf_text_parse_failed_but_paper_was_imported", "PDF text parsing failed; imported paper metadata and file only", exc))
     if parsed["parser"] == "failed":
         parse_status = "failed"
         fallbacks.append("pdf_text_parse_failed_but_paper_was_imported")
@@ -737,21 +785,39 @@ def ingest_pdf(conn: Any, gateway: ToolGateway, task_id: str, file_bytes: bytes,
         fallbacks.append("pdf_text_parse_partial")
     else:
         parse_status = "done"
-    metadata = extract_metadata(target, parsed["text"], parsed["page_count"])
+    try:
+        metadata = extract_metadata(target, parsed["text"], parsed["page_count"])
+    except Exception as exc:
+        metadata = {
+            "title": safe_filename(original_name).replace("_", " "),
+            "authors": "Unknown authors",
+            "year": "",
+            "language": "unknown",
+            "doi": "",
+            "page_count": parsed.get("page_count") or 0,
+            "metadata_source": "filename",
+            "metadata_confidence": 0.2,
+            "metadata_warning": f"Metadata extraction failed: {exc}",
+        }
+        fallbacks.append(fallback_detail("metadata_extraction_failed_filename_used", "Metadata extraction failed; used filename fallback", exc))
     if metadata.get("metadata_warning"):
         fallbacks.append("metadata_fallback_used")
 
     parsed_path = config.PARSED_DIR / f"{paper_id}.txt"
-    gateway.invoke(
-        "Knowledge RAG Agent",
-        "file",
-        "write_parsed_text",
-        parsed_path.write_text,
-        parsed["text"],
-        encoding="utf-8",
-        input_summary=f"{paper_id}; chars={len(parsed['text'])}",
-        output_summarizer=lambda value: str(parsed_path),
-    )
+    try:
+        parsed_path.parent.mkdir(parents=True, exist_ok=True)
+        gateway.invoke(
+            "Knowledge RAG Agent",
+            "file",
+            "write_parsed_text",
+            parsed_path.write_text,
+            parsed["text"],
+            encoding="utf-8",
+            input_summary=f"{paper_id}; chars={len(parsed['text'])}",
+            output_summarizer=lambda value: str(parsed_path),
+        )
+    except Exception as exc:
+        fallbacks.append(fallback_detail("parsed_text_write_failed", "Parsed text cache could not be written", exc))
     now = now_iso()
     paper = {
         "id": paper_id,
@@ -776,57 +842,113 @@ def ingest_pdf(conn: Any, gateway: ToolGateway, task_id: str, file_bytes: bytes,
         "created_at": now,
         "updated_at": now,
     }
-    gateway.invoke(
-        "Knowledge RAG Agent",
-        "database",
-        "insert_paper",
-        insert_paper,
-        conn,
-        paper,
-        input_summary=f"paper_id={paper_id}; title={paper['title']}",
-        output_summarizer=lambda value: f"title={value['title']}; parse_status={value['parse_status']}",
-    )
+    try:
+        gateway.invoke(
+            "Knowledge RAG Agent",
+            "database",
+            "insert_paper",
+            insert_paper,
+            conn,
+            paper,
+            input_summary=f"paper_id={paper_id}; title={paper['title']}",
+            output_summarizer=lambda value: f"title={value['title']}; parse_status={value['parse_status']}",
+        )
+    except sqlite3.IntegrityError as exc:
+        duplicate = conn.execute("SELECT * FROM papers WHERE file_sha256 = ?", (file_hash,)).fetchone()
+        if duplicate:
+            fallbacks.append("duplicate_pdf_returned_existing_paper")
+            return row_to_dict(duplicate) or {}, fallbacks
+        raise RuntimeTaskError(409, "paper_insert_conflict", "A paper with the same unique identifier already exists.") from exc
 
-    document = gateway.invoke(
-        "Knowledge RAG Agent",
-        "rag",
-        "parse_layout_document",
-        parse_pdf_layout,
-        target,
-        paper,
-        parsed["text"],
-        input_summary=f"paper_id={paper_id}; parser={parsed['parser']}",
-        output_summarizer=lambda value: f"pages={len(value.get('pages', []))}; sections={len(value.get('sections', []))}; tables={len(value.get('tables', []))}; figures={len(value.get('figures', []))}",
-    )
-    chunks = build_semantic_chunks(document, paper) if parsed["text"] or document.get("text_blocks") else []
-    save_layout_artifacts(document)
-    (config.PARSED_DIR / paper_id / "chunks.json").write_text(json.dumps(chunks, ensure_ascii=False, indent=2), encoding="utf-8")
-    gateway.invoke(
-        "Knowledge RAG Agent",
-        "database",
-        "insert_chunks",
-        insert_chunks,
-        conn,
-        document,
-        chunks,
-        input_summary=f"paper_id={paper_id}; chunks={len(chunks)}",
-        output_summarizer=lambda value: f"pages={value['pages']}; sections={value['sections']}; chunks={value['chunks']}",
-    )
-    vector_status = "done" if chunks else "skipped"
-    index_result = gateway.invoke(
-        "Knowledge RAG Agent",
-        "rag",
-        "build_vector_index",
-        VECTOR_STORE.index_chunks,
-        chunks,
-        "paper",
-        paper_id,
-        input_summary=f"paper_id={paper_id}; chunks={len(chunks)}",
-        output_summarizer=lambda value: f"backend={value['backend']}; indexed={value['indexed']}; status={value['status']}",
-    )
-    if index_result.get("status") == "fallback_index_recorded":
+    document: dict[str, Any] = {
+        "paper_id": paper_id,
+        "pages": [],
+        "sections": [],
+        "text_blocks": [],
+        "tables": [],
+        "figures": [],
+        "chunks": [],
+        "parse_status": parse_status,
+        "parse_warnings": parsed.get("warnings", []),
+    }
+    try:
+        document = gateway.invoke(
+            "Knowledge RAG Agent",
+            "rag",
+            "parse_layout_document",
+            parse_pdf_layout,
+            target,
+            paper,
+            parsed["text"],
+            input_summary=f"paper_id={paper_id}; parser={parsed['parser']}",
+            output_summarizer=lambda value: f"pages={len(value.get('pages', []))}; sections={len(value.get('sections', []))}; tables={len(value.get('tables', []))}; figures={len(value.get('figures', []))}",
+        )
+    except Exception as exc:
+        parse_status = "partial" if parsed.get("text") else "failed"
+        paper["parse_status"] = parse_status
+        conn.execute("UPDATE papers SET parse_status = ?, parse_warning = ?, updated_at = ? WHERE id = ?", (parse_status, str(exc)[:1200], now_iso(), paper_id))
+        fallbacks.append(fallback_detail("layout_parse_failed_but_paper_was_imported", "Layout parsing failed; paper remains in library", exc))
+
+    chunks: list[dict[str, Any]] = []
+    if parsed.get("text") or document.get("text_blocks"):
+        try:
+            chunks = build_semantic_chunks(document, paper)
+        except Exception as exc:
+            fallbacks.append(fallback_detail("semantic_chunking_failed", "Semantic chunking failed; vector indexing skipped", exc))
+    try:
+        save_layout_artifacts(document)
+        chunks_path = config.PARSED_DIR / paper_id / "chunks.json"
+        chunks_path.write_text(json.dumps(chunks, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        fallbacks.append(fallback_detail("layout_artifact_write_failed", "Layout artifacts could not be written", exc))
+
+    chunks_inserted = False
+    if chunks:
+        try:
+            gateway.invoke(
+                "Knowledge RAG Agent",
+                "database",
+                "insert_chunks",
+                insert_chunks,
+                conn,
+                document,
+                chunks,
+                input_summary=f"paper_id={paper_id}; chunks={len(chunks)}",
+                output_summarizer=lambda value: f"pages={value['pages']}; sections={value['sections']}; chunks={value['chunks']}",
+            )
+            chunks_inserted = True
+        except Exception as exc:
+            fallbacks.append(fallback_detail("chunk_insert_failed", "Chunk storage failed; vector indexing skipped", exc))
+
+    vector_status = "skipped"
+    if chunks and chunks_inserted:
         vector_status = "done"
-    conn.execute("UPDATE papers SET vector_status = ?, updated_at = ? WHERE id = ?", (vector_status, now_iso(), paper_id))
+        try:
+            index_result = gateway.invoke(
+                "Knowledge RAG Agent",
+                "rag",
+                "build_vector_index",
+                VECTOR_STORE.index_chunks,
+                chunks,
+                "paper",
+                paper_id,
+                input_summary=f"paper_id={paper_id}; chunks={len(chunks)}",
+                output_summarizer=lambda value: f"backend={value['backend']}; indexed={value['indexed']}; status={value['status']}",
+            )
+            if index_result.get("status") == "skipped":
+                vector_status = "skipped"
+            elif index_result.get("status") in {"failed", "error"}:
+                vector_status = "failed"
+                fallbacks.append(fallback_detail("vector_index_failed", "Vector indexing failed; paper remains searchable through stored metadata/chunks"))
+            elif index_result.get("status") == "fallback_index_recorded":
+                vector_status = "done"
+                fallbacks.append({"type": "vector_index_fallback_recorded", "message": index_result.get("fallback_reason") or "Vector backend fell back to local keyword retrieval."})
+        except Exception as exc:
+            vector_status = "failed"
+            fallbacks.append(fallback_detail("vector_index_failed", "Vector indexing failed; paper remains in library", exc))
+    elif chunks and not chunks_inserted:
+        vector_status = "failed"
+    conn.execute("UPDATE papers SET parse_status = ?, vector_status = ?, updated_at = ? WHERE id = ?", (paper["parse_status"], vector_status, now_iso(), paper_id))
     paper["vector_status"] = vector_status
     image_extraction = {"status": "skipped", "extracted_count": 0, "skipped_small": 0, "errors": []}
     try:
@@ -1040,6 +1162,8 @@ def generate_note(
             phases.append({"name": "llm_note_generation", "status": "fallback", "summary": "Model note missed required headings; kept local structured note."})
     else:
         fallbacks.append("llm_note_generation_failed_local_note_used")
+        if "llm_result" in locals():
+            fallbacks.append(model_error_fallback("llm_note_generation_failed_local_note_used", llm_result))
         llm_note_generation_status = "fallback"
         partial_reasons.append("llm_note_generation_failed_local_note_used")
         phases.append({"name": "llm_note_generation", "status": "fallback", "summary": "Model call failed; used local note template."})
@@ -1273,9 +1397,10 @@ abstract_mode: {query_analysis.get('abstract_mode', '')}
         log_mcp(gateway.conn, task_id, "llm", "model_chat", result.model, result.usage_summary or "Grouped evidence answer generated.")
         return result.content
     fallbacks.append("model_chat_failed_local_rag_answer_used")
+    fallbacks.append(model_error_fallback("model_chat_failed_local_rag_answer_used", result))
     log_mcp(gateway.conn, task_id, "llm", "model_chat", result.model, "Model call failed.", status="error", error=result.error)
     bullets = "\n".join(f"- {item.get('section_name', '')}: {(item.get('text') or '')[:220]}" for item in evidence[:3])
-    return f"Model call failed; using a local grouped-evidence fallback answer.\n{bullets}"
+    return f"Model call failed ({result.error_type or 'unknown_model_error'}); using a local grouped-evidence fallback answer.\n{bullets}"
 
 
 def handle_vision_chat(

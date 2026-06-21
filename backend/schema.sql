@@ -325,3 +325,17 @@ CREATE TABLE IF NOT EXISTS mcp_tool_calls (
 );
 
 CREATE INDEX IF NOT EXISTS idx_mcp_tool_calls_task_id ON mcp_tool_calls(task_id);
+
+CREATE TABLE IF NOT EXISTS harness_decisions (
+  id TEXT PRIMARY KEY,
+  task_id TEXT,
+  stage TEXT,
+  decision TEXT,
+  reason TEXT,
+  agent TEXT,
+  tool TEXT,
+  status TEXT,
+  created_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_harness_decisions_task_id ON harness_decisions(task_id);

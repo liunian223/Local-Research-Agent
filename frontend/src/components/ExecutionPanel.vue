@@ -21,6 +21,11 @@
         <div><span>redaction</span><strong>{{ harness.redaction?.enabled ? "enabled" : "disabled" }}</strong></div>
       </div>
 
+      <details class="nested-details" :open="harnessDecisions.length > 0">
+        <summary>Harness 决策 ({{ harnessDecisions.length }})</summary>
+        <pre>{{ stringify(harnessDecisions) }}</pre>
+      </details>
+
       <div class="section-title">RAG retrieval strategy</div>
       <div class="rag-summary">
         <div><span>query complexity</span><strong>{{ textValue(queryAnalysis.complexity) }}</strong></div>
@@ -140,6 +145,7 @@ const bundle = computed<EvidenceBundle>(() => execution.value.evidence_bundle ||
 const noteGeneration = computed<NoteGenerationSummary>(() => execution.value.note_generation || {});
 const visionExecution = computed<JsonObject>(() => objectValue(execution.value.vision_execution));
 const pdfImageExtraction = computed<JsonObject>(() => objectValue(execution.value.pdf_image_extraction));
+const harnessDecisions = computed(() => execution.value.harness_decisions || []);
 const evidenceCount = computed(() => execution.value.rag_evidence?.length || 0);
 const hasAbstractControl = computed(() => Object.keys(abstractControl.value).length > 0);
 const hasCoverage = computed(() => Object.keys(coverage.value).length > 0);

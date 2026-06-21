@@ -47,7 +47,21 @@ export interface SendMessagePayload {
 
 export function apiMessage(err: unknown): string {
   if (axios.isAxiosError(err)) {
-    return err.response?.data?.detail?.error?.message || err.response?.data?.detail || err.message;
+    const data = err.response?.data as any;
+    const detail = data?.detail;
+    const fallbacks = data?.execution?.fallbacks || detail?.execution?.fallbacks || data?.fallbacks || detail?.fallbacks;
+    const fallbackText = Array.isArray(fallbacks)
+      ? fallbacks
+          .map((item) => (typeof item === "string" ? item : item?.message || item?.type || ""))
+          .filter(Boolean)
+          .join("; ")
+      : "";
+    if (data?.error?.message) return data.error.message;
+    if (detail?.error?.message) return detail.error.message;
+    if (typeof detail === "string") return detail;
+    if (fallbackText) return fallbackText;
+    if (data?.message) return data.message;
+    return err.message;
   }
   return String(err);
 }

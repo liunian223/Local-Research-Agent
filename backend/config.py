@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 
 PROJECT_NAME = "Local Research Agent"
@@ -10,10 +10,13 @@ BACKEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BACKEND_DIR.parent
 
 ENV_NAME = os.getenv("LOCAL_RESEARCH_AGENT_ENV", "development")
+BACKEND_ENV_FILE = BACKEND_DIR / ".env"
+_ENV_BEFORE_DOTENV = dict(os.environ)
+_BACKEND_ENV_VALUES = dotenv_values(BACKEND_ENV_FILE)
 
 # Prefer the project-local .env over stale shell/user environment variables in
 # normal runs. Tests set environment values directly and should keep priority.
-load_dotenv(BACKEND_DIR / ".env", override=ENV_NAME != "test")
+load_dotenv(BACKEND_ENV_FILE, override=ENV_NAME != "test")
 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "codex")
 DISABLE_OPENAI_API = os.getenv("DISABLE_OPENAI_API", "true").lower() == "true"
@@ -137,3 +140,14 @@ def ensure_directories() -> None:
         OBSIDIAN_VAULT_PATH / OBSIDIAN_NOTE_DIR,
     ]:
         path.mkdir(parents=True, exist_ok=True)
+
+
+def config_key_source(name: str) -> str:
+    value = os.getenv(name, "")
+    if not value:
+        return "missing"
+    if name in _ENV_BEFORE_DOTENV:
+        return "env"
+    if _BACKEND_ENV_VALUES.get(name):
+        return "backend_env_file"
+    return "env"

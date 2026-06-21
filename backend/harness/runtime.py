@@ -4,6 +4,7 @@ from typing import Any, Callable
 
 from database import connect, new_id, now_iso, row_to_dict
 from graph.builder import initial_phase, standard_flow, validate_node_visits
+from harness.decisions import log_harness_decision
 from harness.execution_builder import build_task_execution, save_task_execution
 
 
@@ -42,6 +43,16 @@ def run_upload_task(
         conn.execute(
             "INSERT INTO agent_tasks (id, task_type, user_input, status, current_folder_id, session_id, run_id, chat_scope, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (task_id, task_type, message, "running", folder_id, resolved_session_id, run_id, "paper_and_note", now_iso(), now_iso()),
+        )
+        log_harness_decision(
+            conn,
+            task_id,
+            stage="task_routing",
+            decision=task_type,
+            reason="upload message routed by task_type_from_message",
+            agent="Coordinator",
+            tool="task_type_resolver",
+            status="ok",
         )
         final_state = upload_graph_runner(conn, task_id, task_type, file_bytes, file_name, folder_id, message)
         paper = final_state.get("paper", {})
@@ -100,6 +111,16 @@ def run_chat_task(
         conn.execute(
             "INSERT INTO agent_tasks (id, task_type, user_input, status, current_paper_id, current_folder_id, session_id, run_id, chat_scope, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (task_id, task_type, payload.message, "running", payload.current_paper_id, payload.current_folder_id, resolved_session_id, run_id, payload.chat_scope, now_iso(), now_iso()),
+        )
+        log_harness_decision(
+            conn,
+            task_id,
+            stage="task_routing",
+            decision=task_type,
+            reason="chat message routed by task_type_from_message",
+            agent="Coordinator",
+            tool="task_type_resolver",
+            status="ok",
         )
         paper = None
         if payload.current_paper_id:

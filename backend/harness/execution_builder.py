@@ -52,6 +52,7 @@ def build_task_execution(
     traces = rows_to_dicts(conn.execute("SELECT * FROM agent_traces WHERE task_id = ? ORDER BY step_index ASC", (task_id,)).fetchall())
     mcp = rows_to_dicts(conn.execute("SELECT * FROM mcp_tool_calls WHERE task_id = ? ORDER BY created_at ASC", (task_id,)).fetchall())
     a2a = rows_to_dicts(conn.execute("SELECT * FROM a2a_messages WHERE task_id = ? ORDER BY created_at ASC", (task_id,)).fetchall())
+    decisions = rows_to_dicts(conn.execute("SELECT * FROM harness_decisions WHERE task_id = ? ORDER BY created_at ASC", (task_id,)).fetchall())
     task = row_to_dict(conn.execute("SELECT * FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()) or {}
     visited = [trace["node_name"] for trace in traces]
     visits_ok, visits_error = validate_node_visits(visited)
@@ -61,8 +62,10 @@ def build_task_execution(
     note_model_execution = (note_generation or {}).get("model_execution") or {}
     if note_model_execution:
         model_execution = {**model_execution, **note_model_execution}
+    harness_decisions = decisions + fallback_decisions(fallbacks)
     return {
         "harness": build_harness_execution(task, mcp, fallbacks),
+        "harness_decisions": harness_decisions,
         "graph_state": {
             "task_type": task.get("task_type"),
             "initial_phase": initial_phase(task.get("task_type", "")),
@@ -110,6 +113,28 @@ def summarize_tool_calls(mcp_calls: list[dict[str, Any]]) -> dict[str, Any]:
         "calls_by_server": by_server,
         "total_latency_ms": latency,
     }
+
+
+def fallback_decisions(fallbacks: list[Any]) -> list[dict[str, Any]]:
+    decisions: list[dict[str, Any]] = []
+    for item in fallbacks:
+        if isinstance(item, dict):
+            fallback_type = str(item.get("type") or "fallback")
+            reason = str(item.get("message") or item.get("fallback_reason") or item.get("reason") or item)
+        else:
+            fallback_type = str(item)
+            reason = fallback_type
+        decisions.append(
+            {
+                "stage": "fallback",
+                "decision": fallback_type,
+                "reason": reason[:800],
+                "agent": "Harness",
+                "tool": "",
+                "status": "fallback",
+            }
+        )
+    return decisions
 
 
 def task_duration_ms(task: dict[str, Any]) -> int:

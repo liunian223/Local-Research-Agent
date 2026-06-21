@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from database import log_mcp
 from harness.context_manager import redact_value
+from harness.decisions import log_harness_decision
 from harness.policy import POLICY_RULES, check_tool_policy
 
 
@@ -66,7 +67,27 @@ class ToolGateway:
     def _check_policy(self, agent_name: str, server_name: str, tool_name: str) -> dict[str, Any]:
         policy_check = check_tool_policy(agent_name, server_name, tool_name)
         if not policy_check["allowed"]:
+            log_harness_decision(
+                self.conn,
+                self.task_id,
+                stage="tool_policy",
+                decision="deny",
+                reason=policy_check["reason"],
+                agent=agent_name,
+                tool=f"{server_name}.{tool_name}",
+                status="denied",
+            )
             raise PermissionError(policy_check["reason"])
+        log_harness_decision(
+            self.conn,
+            self.task_id,
+            stage="tool_policy",
+            decision="allow",
+            reason=policy_check["reason"],
+            agent=agent_name,
+            tool=f"{server_name}.{tool_name}",
+            status="ok",
+        )
         return policy_check
 
 

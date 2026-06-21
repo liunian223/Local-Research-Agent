@@ -4,6 +4,20 @@ Local Research Agent is a local research-paper assistant. It provides a small pa
 
 The project is already more than a plain PDF QA demo: it has LangGraph-style agent orchestration, Adaptive Layout-Aware RAG v2, a Note Skill Agent flow, ToolGateway/MCP call records, execution payloads, and persisted chat sessions. The P0 handoff is complete: upload and chat endpoints now enter through `backend/harness/runtime.py`, execution payload building and persistence live under `backend/harness/execution_builder.py`, chat history restores saved assistant execution payloads from `agent_tasks.execution_json`, and deleting a paper cleans paper/note vector records before database rows are removed. The P1 boundary pass is complete as well: Database MCP now exposes named paper/chunk/delete tools, key upload/note/delete database writes use those named wrappers, and trace/MCP/A2A logs share the same redaction helper. The P2 frontend pass is complete: execution payloads now have typed frontend contracts, the execution panel shows readable structured summaries before raw JSON details, and the main chat UI text has been cleaned up. The upload/chat LangGraph runner lives in `backend/harness/graph_runner.py`, upload ingest, retrieval, note generation, and answer synthesis live in `backend/harness/agent_service.py`, and paper library/delete workflows live in `backend/harness/library_service.py`; `backend/app.py` is now mostly the FastAPI boundary.
 
+## Current Demo Acceptance
+
+The current local demo has been validated against two real SSVEP-related PDFs already imported into the local library:
+
+- Chinese paper: `SSVEP 赛题-窄带随机编码`, imported successfully with `parse_status=done`, `vector_status=done`, and `note_status=partial`.
+- English paper: `Human-centred physical neuromorphics with visual brain-computer interfaces`, imported successfully with `parse_status=done`, `vector_status=done`, and `note_status=done`.
+- Real RAG eval file: `backend/eval/rag_eval_set.local.jsonl`.
+- RAG eval results: 12 runnable cases, 0 skipped, `Recall@3=0.8206`, `Recall@5=0.8444`, `MRR=0.9167`, and `Evidence Hit Rate=1.0`.
+- Demo QA scopes validated with HTTP 200 responses: `paper_only`, `note_only`, `paper_and_note`, and `global_library`.
+- `harness_decisions` and `rag_evidence` are present in the execution payload and can be expanded in the existing frontend execution panel.
+- During demo QA, the external model call failed and the system returned grouped-evidence fallback answers with HTTP 200, showing that the local retrieval and evidence path does not depend on a single LLM call being available.
+
+Detailed records are in `docs/rag_eval_report.md`, `docs/demo_acceptance.md`, and `docs/final_demo_summary.md`.
+
 ## Current Core Capabilities
 
 - PDF upload with filename, extension, size, header, and path safety checks.

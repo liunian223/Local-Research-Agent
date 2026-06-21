@@ -130,6 +130,7 @@ export interface NoteGenerationSummary {
 
 export interface ExecutionPayload {
   harness?: HarnessExecution;
+  harness_decisions?: JsonValue[];
   graph_state?: GraphStateSummary;
   langgraph_nodes?: JsonValue[];
   mcp_tool_calls?: JsonValue[];

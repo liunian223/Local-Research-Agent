@@ -24,6 +24,15 @@ def test_tool_gateway_logs_policy_checked_call() -> None:
 def test_tool_gateway_denies_forbidden_tool() -> None:
     init_db()
     with connect() as conn:
-        gateway = ToolGateway(conn, "task_missing")
+        task_id = new_id("task")
+        conn.execute(
+            "INSERT INTO agent_tasks (id, task_type, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (task_id, "paper_chat", "running", "now", "now"),
+        )
+        gateway = ToolGateway(conn, task_id)
         with pytest.raises(PermissionError):
             gateway.invoke("Knowledge RAG Agent", "skills", "run_deep_paper_note_skill", lambda: "bad")
+        decisions = rows_to_dicts(conn.execute("SELECT * FROM harness_decisions WHERE task_id = ?", (task_id,)).fetchall())
+    assert decisions
+    assert decisions[0]["decision"] == "deny"
+    assert decisions[0]["status"] == "denied"

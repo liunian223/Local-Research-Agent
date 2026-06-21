@@ -66,6 +66,11 @@ def health() -> dict[str, Any]:
     }
 
 
+@app.get("/api/model/diagnostics")
+def model_diagnostics(run_probe: bool = False) -> dict[str, Any]:
+    return get_model_gateway().diagnostics(run_probe=run_probe)
+
+
 @app.get("/api/codex/health")
 def codex_health_check(run_probes: bool = False) -> dict[str, Any]:
     try:
@@ -172,6 +177,8 @@ async def upload_pdf(file: UploadFile = File(...), current_folder_id: str = Form
         )
     except RuntimeTaskError as exc:
         raise api_error(exc.status, exc.code, exc.message) from exc
+    except Exception as exc:
+        raise api_error(500, "upload_failed", f"PDF upload failed: {exc}") from exc
 
 
 
@@ -189,4 +196,6 @@ def chat_message(payload: ChatMessage) -> dict[str, Any]:
         )
     except RuntimeTaskError as exc:
         raise api_error(exc.status, exc.code, exc.message) from exc
+    except Exception as exc:
+        raise api_error(500, "chat_task_failed", f"Chat task failed: {exc}") from exc
 

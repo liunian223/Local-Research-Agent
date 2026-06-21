@@ -128,6 +128,81 @@ def test_upload_security_rejects_bad_mime_and_bad_pdf_header() -> None:
         assert bad_header.json()["detail"]["error"]["code"] == "invalid_pdf"
 
 
+def test_upload_two_pdfs_sequentially(tmp_path: Path) -> None:
+    with TestClient(app) as client:
+        chinese_pdf = make_pdf(
+            tmp_path,
+            "sequential_chinese.pdf",
+            "连续上传中文论文\n作者 A\n2026\n摘要\n这篇论文用于验证第二篇 PDF 上传不会返回 500。",
+        )
+        english_pdf = make_pdf(
+            tmp_path,
+            "Human-centred physical neuromorphics with visual brain-computer interfaces.pdf",
+            (
+                "Human-centred physical neuromorphics with visual brain-computer interfaces\n"
+                "Author B\n2026\nAbstract\nThis paper validates sequential English PDF upload after a Chinese paper."
+            ),
+        )
+
+        first = post_pdf(client, chinese_pdf)
+        second = post_pdf(client, english_pdf)
+        assert first.status_code == 200
+        assert second.status_code == 200
+
+        first_id = first.json()["current_paper"]["paper_id"]
+        second_id = second.json()["current_paper"]["paper_id"]
+        assert first_id != second_id
+        papers = client.get("/api/papers", params={"folder_id": "folder_all"}).json()["papers"]
+        paper_ids = {paper["id"] for paper in papers}
+        assert {first_id, second_id}.issubset(paper_ids)
+
+
+def test_upload_duplicate_pdf_returns_existing_or_safe_response(tmp_path: Path) -> None:
+    with TestClient(app) as client:
+        pdf = make_pdf(
+            tmp_path,
+            "duplicate_safe_upload.pdf",
+            "Duplicate Safe Upload\nAuthor A\n2026\nAbstract\nThis paper validates duplicate upload handling.",
+        )
+
+        first = post_pdf(client, pdf)
+        duplicate = post_pdf(client, pdf)
+        assert first.status_code == 200
+        assert duplicate.status_code == 200
+        assert duplicate.json()["current_paper"]["paper_id"] == first.json()["current_paper"]["paper_id"]
+        assert "duplicate_pdf_returned_existing_paper" in duplicate.json()["execution"]["fallbacks"]
+
+
+def test_upload_vector_failure_keeps_paper_and_reports_fallback(tmp_path: Path, monkeypatch) -> None:
+    def failing_index_chunks(*args, **kwargs):
+        raise RuntimeError("simulated vector failure")
+
+    monkeypatch.setattr("harness.agent_service.VECTOR_STORE.index_chunks", failing_index_chunks)
+    with TestClient(app) as client:
+        pdf = make_multipage_pdf(
+            tmp_path,
+            "vector_failure_upload.pdf",
+            [
+                "Vector Failure Upload\nAuthor A\n2026\nAbstract\n" + ("This abstract contains enough text for extraction. " * 80),
+                "Methods\n" + ("This body validates vector fallback handling during upload. " * 120),
+            ],
+        )
+
+        upload = post_pdf(client, pdf)
+        assert upload.status_code == 200
+        body = upload.json()
+        paper_id = body["current_paper"]["paper_id"]
+        assert any(
+            item.get("type") == "vector_index_failed"
+            for item in body["execution"]["fallbacks"]
+            if isinstance(item, dict)
+        )
+
+        paper = client.get(f"/api/papers/{paper_id}")
+        assert paper.status_code == 200
+        assert paper.json()["paper"]["vector_status"] == "failed"
+
+
 def test_import_note_artifacts_execution_and_paper_and_note_scope(tmp_path: Path) -> None:
     with TestClient(app) as client:
         pdf = make_pdf(
@@ -519,6 +594,17 @@ def test_chat_sessions_store_separate_histories() -> None:
         assert any(item["text"] == "session alpha question" for item in history_a)
         assert not any(item["text"] == "session beta question" for item in history_a)
         assert any(item["text"] == "session beta question" for item in history_b)
+
+
+def test_create_chat_session() -> None:
+    with TestClient(app) as client:
+        created = client.post("/api/chat/sessions", json={"title": "新对话"})
+        assert created.status_code == 200
+        session_id = created.json()["session"]["id"]
+
+        sessions = client.get("/api/chat/sessions")
+        assert sessions.status_code == 200
+        assert session_id in {session["id"] for session in sessions.json()["sessions"]}
 
 
 def test_delete_chat_session_removes_history_and_returns_next_session() -> None:

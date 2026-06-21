@@ -20,3 +20,7 @@ def test_execution_payload_contains_harness_runtime(tmp_path: Path) -> None:
         assert "policy_checks" in harness
         assert harness["tool_summary"]["total_calls"] > 0
         assert harness["redaction"]["enabled"] is True
+        decisions = response.json()["execution"]["harness_decisions"]
+        assert decisions
+        assert {"task_routing", "file_security", "tool_policy"} <= {item["stage"] for item in decisions}
+        assert all({"stage", "decision", "reason", "agent", "tool", "status"} <= set(item) for item in decisions)

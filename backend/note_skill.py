@@ -168,6 +168,10 @@ def run_deep_paper_note_skill(
         quality = detailed_quality_check(markdown)
         phases.append({"name": "partial_note_fallback", "status": "success", "summary": "Generated degraded structured note."})
 
+    markdown, evidence_binding_quality = apply_evidence_bindings(markdown, flat_evidence)
+    quality = {**detailed_quality_check(markdown), **evidence_binding_quality}
+    phases.append({"name": "evidence_binding", "status": "success" if quality["has_evidence_binding"] else "partial", "summary": f"Missing evidence-bound sections: {len(quality['missing_evidence_sections'])}."})
+
     return {
         "status": "success" if quality["ok"] else "partial",
         "note_markdown": markdown,
@@ -275,6 +279,51 @@ def build_note_markdown_from_bundle(paper: dict[str, Any], note_bundle: dict[str
         markdown = markdown.replace("## 5. 鏂规硶姒傝堪", "## 5. 鏂规硶姒傝堪\n" + "\n".join(f"- {item}" for item in warnings) + "\n", 1)
     phases.append({"name": "apply_abstract_rules", "status": "success", "summary": f"Applied abstract evidence rules; warnings={len(warnings)}."})
     return markdown, quality, phases
+
+
+def apply_evidence_bindings(markdown: str, evidence: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+    grouped = {
+        "method": [item for item in evidence if note_evidence_bucket(item) == "method"],
+        "experiment": [item for item in evidence if note_evidence_bucket(item) in {"experiment", "tables"}],
+        "result": [item for item in evidence if note_evidence_bucket(item) in {"result", "tables", "figures"}],
+        "innovation": [item for item in evidence if note_evidence_bucket(item) in {"method", "result", "discussion", "conclusion"}],
+        "limitations": [item for item in evidence if note_evidence_bucket(item) in {"limitations", "discussion", "conclusion"}],
+    }
+    heading_map = {
+        "method": "## 5.",
+        "experiment": "## 7.",
+        "result": "## 8.",
+        "innovation": "## 9.",
+        "limitations": "## 10.",
+    }
+    missing = [section for section, items in grouped.items() if not items]
+    for section, heading in heading_map.items():
+        block = evidence_binding_block(grouped[section], section)
+        markdown = insert_after_heading_prefix(markdown, heading, block)
+    return markdown, {
+        "has_evidence_binding": not missing,
+        "missing_evidence_sections": missing,
+    }
+
+
+def evidence_binding_block(items: list[dict[str, Any]], section: str) -> str:
+    if not items:
+        return f"Evidence binding ({section}): 当前解析结果中没有足够证据"
+    lines = [f"Evidence binding ({section}):"]
+    for index, item in enumerate(items[:3]):
+        evidence_id = item.get("chunk_id") or item.get("id") or f"evidence_{index}"
+        location = item.get("section_name") or item.get("section_path") or item.get("source_type") or "evidence"
+        lines.append(f"- [{evidence_id}] {location}: {_clip(item.get('text', ''), 260)}")
+    return "\n".join(lines)
+
+
+def insert_after_heading_prefix(markdown: str, heading_prefix: str, block: str) -> str:
+    lines = markdown.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(heading_prefix):
+            lines.insert(index + 1, block)
+            return "\n".join(lines) + ("\n" if markdown.endswith("\n") else "")
+    return markdown
 
 
 def is_long_paper(paper: dict[str, Any], full_text: str, chunks: list[dict[str, Any]]) -> bool:
