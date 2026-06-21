@@ -64,6 +64,9 @@ def _detect_from_first_page(document: dict[str, Any]) -> dict[str, Any]:
         for block in document.get("text_blocks") or []
         if (block.get("page_number") or 1) == 1 and not block.get("is_header") and not block.get("is_footer")
     ]
+    explicit = _detect_explicit_abstract_heading(blocks, document)
+    if explicit:
+        return explicit
     candidate_blocks: list[dict[str, Any]] = []
     started = False
     for block in blocks[:12]:
@@ -103,6 +106,50 @@ def _detect_from_first_page(document: dict[str, Any]) -> dict[str, Any]:
         "confidence": 0.55,
         "warnings": [],
     }
+
+
+def _detect_explicit_abstract_heading(blocks: list[dict[str, Any]], document: dict[str, Any]) -> dict[str, Any] | None:
+    for block_index, block in enumerate(blocks[:12]):
+        lines = [line.strip() for line in (block.get("text") or "").splitlines() if line.strip()]
+        heading_index = next((idx for idx, line in enumerate(lines) if _is_abstract_heading(line)), None)
+        if heading_index is None:
+            continue
+
+        selected_blocks: list[dict[str, Any]] = []
+        collected_lines: list[str] = []
+        reached_boundary = False
+        for scan_index, scan_block in enumerate(blocks[block_index:12], start=block_index):
+            scan_lines = [line.strip() for line in (scan_block.get("text") or "").splitlines() if line.strip()]
+            start_line = heading_index + 1 if scan_index == block_index else 0
+            block_contributed = False
+            for line in scan_lines[start_line:]:
+                if _is_end_heading(line):
+                    reached_boundary = True
+                    break
+                if _is_abstract_heading(line):
+                    continue
+                collected_lines.append(line)
+                block_contributed = True
+            if block_contributed or scan_index == block_index:
+                selected_blocks.append(scan_block)
+            if reached_boundary or len(" ".join(collected_lines)) > 3500:
+                break
+
+        abstract_text = _clean_abstract_text("\n".join(collected_lines))
+        if len(abstract_text.split()) < 4:
+            continue
+        return {
+            "has_abstract": True,
+            "abstract_text": abstract_text,
+            "page_start": min((block.get("page_number") for block in selected_blocks if block.get("page_number")), default=1),
+            "page_end": max((block.get("page_number") for block in selected_blocks if block.get("page_number")), default=1),
+            "block_ids": [block.get("block_id") for block in selected_blocks if block.get("block_id")],
+            "section_id": "",
+            "boundary_source": "explicit_first_page_heading",
+            "confidence": 0.85,
+            "warnings": [],
+        }
+    return None
 
 
 def _mark_document(document: dict[str, Any], result: dict[str, Any]) -> None:

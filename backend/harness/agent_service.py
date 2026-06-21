@@ -13,6 +13,7 @@ from graph.state import AgentState
 from harness.graph_runner import run_chat_agent_graph, run_upload_agent_graph
 from harness.runtime import RuntimeTaskError
 from layout_parser import parse_pdf_layout, save_layout_artifacts
+from llm.codex_diagnostics import codex_health
 from llm.model_gateway import get_model_gateway
 from mcp_servers.database_mcp_server import insert_chunks, insert_image_assets, insert_note, insert_note_chunks, insert_paper, update_paper_status
 from mcp_servers.file_mcp_server import copy_pdf_to_obsidian, read_pdf_text, save_uploaded_pdf, write_markdown_note
@@ -47,6 +48,10 @@ def remove_local_note_generation_fallbacks(fallbacks: list[Any]) -> list[Any]:
     local_note_fallbacks = {
         "partial_note_fallback",
         "long_paper_staged_generation",
+        "llm_note_generation_failed_local_note_used",
+        "llm_note_generation_incomplete_local_note_used",
+        "model_note_generation_failed_local_note_used",
+        "model_note_missing_required_sections_local_note_used",
     }
     return [
         item
@@ -68,6 +73,22 @@ def explain_note_partial_reasons(reasons: list[str]) -> list[str]:
         "llm_note_generation_not_successful": "llm_note_generation did not finish successfully",
     }
     return [labels.get(reason, reason) for reason in reasons]
+
+
+def codex_vision_probe_allows_note_images() -> tuple[bool, dict[str, Any]]:
+    providers = {config.LLM_PROVIDER.lower(), config.TEXT_MODEL_PROVIDER.lower(), config.VISION_MODEL_PROVIDER.lower()}
+    if not providers & {"codex", "codex_cli", "codex_runtime"}:
+        return True, {"vision_probe_status": "not_required"}
+    try:
+        health = codex_health(run_text=False, run_vision=True)
+    except Exception as exc:
+        return False, {"vision_probe_status": "error", "vision_probe_error": str(exc)[:300]}
+    if health.get("vision_ok") is True:
+        return True, {"vision_probe_status": "ok"}
+    return False, {
+        "vision_probe_status": "failed" if health.get("vision_ok") is False else "unavailable",
+        "vision_probe_error": health.get("vision_error_summary") or health.get("recommendation") or "",
+    }
 
 
 def format_note_downgrade_for_answer(note_generation: dict[str, Any]) -> str:
@@ -933,16 +954,59 @@ def generate_note(
         phases.append({"name": "multimodal_evidence", "status": "success", "summary": f"Attached {len(image_paths)} figure/page images for model note generation."})
     else:
         phases.append({"name": "multimodal_evidence", "status": "skipped", "summary": "No extracted figure/page images available for model note generation."})
-    llm_started = time.perf_counter()
-    llm_result = model_gateway.generate_text(
-        prompt,
-        system=system,
-        purpose="note",
-        temperature=0.2,
-        max_output_tokens=3600,
-        image_paths=image_paths,
-    )
-    llm_latency_ms = max(1, int((time.perf_counter() - llm_started) * 1000))
+    model_execution_attempts: dict[str, Any] = {
+        "first_model_attempt": "",
+        "first_model_attempt_status": "not_called",
+        "retry_model_attempt": "",
+        "retry_model_attempt_status": "not_called",
+        "image_count_attempted": 0,
+        "image_count_available": len(image_paths),
+    }
+    images_allowed, vision_probe_meta = codex_vision_probe_allows_note_images() if image_paths else (False, {"vision_probe_status": "not_checked_no_images"})
+    model_execution_attempts.update(vision_probe_meta)
+    if image_paths and not images_allowed:
+        fallbacks.append("codex_vision_unavailable_text_only_note_generation")
+        phases.append({"name": "codex_vision_probe", "status": "fallback", "summary": "Codex vision probe did not pass; using text-only note generation."})
+
+    def run_note_model_attempt(attempt_images: list[str]):
+        started = time.perf_counter()
+        result = model_gateway.generate_text(
+            prompt,
+            system=system,
+            purpose="note",
+            temperature=0.2,
+            max_output_tokens=3600,
+            image_paths=attempt_images,
+        )
+        latency_ms = max(1, int((time.perf_counter() - started) * 1000))
+        return result, latency_ms
+
+    first_attempt = "codex_multimodal" if image_paths and images_allowed else "codex_text_only"
+    first_images = image_paths if first_attempt == "codex_multimodal" else []
+    model_execution_attempts["first_model_attempt"] = first_attempt
+    model_execution_attempts["image_count_attempted"] = len(first_images)
+    final_attempt = first_attempt
+    final_image_count = len(first_images)
+    llm_result, llm_latency_ms = run_note_model_attempt(first_images)
+    if llm_result.ok:
+        model_execution_attempts["first_model_attempt_status"] = "ok"
+    else:
+        model_execution_attempts["first_model_attempt_status"] = "failed" if first_attempt == "codex_multimodal" else "error"
+        log_mcp(conn, task_id, "llm", "model_note_generation", f"{llm_result.model}; images={len(first_images)}; attempt={first_attempt}", "Model note generation failed.", status="error", error=llm_result.error, latency_ms=llm_latency_ms)
+        if first_attempt == "codex_multimodal":
+            retry_attempt = "codex_text_only"
+            model_execution_attempts["retry_model_attempt"] = retry_attempt
+            retry_result, retry_latency_ms = run_note_model_attempt([])
+            if retry_result.ok:
+                model_execution_attempts["retry_model_attempt_status"] = "ok"
+                fallbacks.append("multimodal_failed_text_retry_succeeded")
+            else:
+                model_execution_attempts["retry_model_attempt_status"] = "error"
+                log_mcp(conn, task_id, "llm", "model_note_generation", f"{retry_result.model}; images=0; attempt={retry_attempt}", "Text-only retry for model note generation failed.", status="error", error=retry_result.error, latency_ms=retry_latency_ms)
+            final_attempt = retry_attempt
+            final_image_count = 0
+            llm_result, llm_latency_ms = retry_result, retry_latency_ms
+
     if llm_result.ok:
         llm_quality = check_required_note_sections(llm_result.content)
         llm_note_generation_status = "ok"
@@ -951,8 +1015,8 @@ def generate_note(
             task_id,
             "llm",
             "model_note_generation",
-            f"{llm_result.model}; images={len(image_paths)}",
-            llm_result.usage_summary or f"Model note generated; images={len(image_paths)}",
+            f"{llm_result.model}; images={final_image_count}; attempt={final_attempt}",
+            llm_result.usage_summary or "Model note generated.",
             latency_ms=llm_latency_ms,
         )
         if llm_quality["ok"]:
@@ -965,7 +1029,7 @@ def generate_note(
                 "llm_generated": True,
                 "model": llm_result.model,
                 "usage_summary": llm_result.usage_summary,
-                "multimodal_image_count": len(image_paths),
+                "multimodal_image_count": final_image_count,
             }
             phases.append({"name": "llm_note_generation", "status": "ok", "summary": f"Generated note with {llm_result.model}."})
         else:
@@ -978,7 +1042,6 @@ def generate_note(
         fallbacks.append("llm_note_generation_failed_local_note_used")
         llm_note_generation_status = "fallback"
         partial_reasons.append("llm_note_generation_failed_local_note_used")
-        log_mcp(conn, task_id, "llm", "model_note_generation", f"{llm_result.model}; images={len(image_paths)}", "Model note generation failed.", status="error", error=llm_result.error, latency_ms=llm_latency_ms)
         phases.append({"name": "llm_note_generation", "status": "fallback", "summary": "Model call failed; used local note template."})
     if local_template_used:
         partial_reasons.append("local_template_used")
@@ -1132,6 +1195,7 @@ def generate_note(
         "pdf_attachment_path": str(attachment_path),
         "evidence_group_counts": quality.get("evidence_group_counts", {}),
         "evidence_coverage": evidence_coverage,
+        "model_execution": model_execution_attempts,
         "retrieval": retrieve_meta,
     }
     return markdown, quality, phases, evidence, fallbacks, note_generation

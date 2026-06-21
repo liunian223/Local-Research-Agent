@@ -57,6 +57,10 @@ def build_task_execution(
     visits_ok, visits_error = validate_node_visits(visited)
     retrieval_meta = retrieval or {}
     evidence_bundle = retrieval_meta.get("final_note_evidence_bundle") or build_evidence_bundle(evidence, retrieval_meta)
+    model_execution = get_model_gateway().model_execution_info()
+    note_model_execution = (note_generation or {}).get("model_execution") or {}
+    if note_model_execution:
+        model_execution = {**model_execution, **note_model_execution}
     return {
         "harness": build_harness_execution(task, mcp, fallbacks),
         "graph_state": {
@@ -70,7 +74,7 @@ def build_task_execution(
         "mcp_tool_calls": mcp,
         "a2a_messages": a2a,
         "skill_phases": skill_phases,
-        "model_execution": get_model_gateway().model_execution_info(),
+        "model_execution": model_execution,
         "rag_evidence": evidence,
         "evidence_bundle": evidence_bundle,
         "rag_pipeline": rag_pipeline_summary(conn, paper_id or task.get("current_paper_id")),

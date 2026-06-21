@@ -90,6 +90,10 @@ def test_abstract_chunks_are_persisted_separately(tmp_path: Path) -> None:
         assert abstract_chunk is not None
         assert body_chunk is not None
         assert "Keywords" not in abstract_chunk["content"]
+        assert abstract_chunk["chunk_role"] == "abstract"
+        assert (abstract_chunk["section_path"] or abstract_chunk["section_name"]).lower().startswith("abstract")
+        assert body_chunk["is_abstract"] in (0, None)
+        assert body_chunk["chunk_role"] == "body"
 
 
 def test_adaptive_retriever_selects_expected_modes_without_evidence() -> None:
